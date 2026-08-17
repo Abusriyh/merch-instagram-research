@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'probe_pixwox_pagination.py'
+      - 'probe_pixnoy_profile.py'
       - '.github/workflows/pixwox-probe.yml'
   workflow_dispatch:
 
@@ -14,18 +15,23 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install curl_cffi==0.13.0
-      - run: python probe_pixwox_pagination.py
+      - run: pip install curl_cffi==0.13.0 beautifulsoup4==4.13.4
+      - name: Probe Pixwox pagination contract
+        run: python probe_pixwox_pagination.py
+      - name: Resolve Pixnoy profile IDs and call posts API
+        run: python probe_pixnoy_profile.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pixwox-pagination-probe
-          path: pixwox_pagination_probe.json
+          name: pixwox-combined-probe
+          path: |
+            pixwox_pagination_probe.json
+            pixnoy_profile_probe.json
           if-no-files-found: warn
           retention-days: 7
