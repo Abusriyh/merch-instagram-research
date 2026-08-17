@@ -3,26 +3,56 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-from ultralytics import YOLO
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForObjectDetection,
+    AutoModelForZeroShotImageClassification,
+    AutoProcessor,
+)
 
-CLASSIFIER_REPO = "dima806/clothes_image_detection"
-NEGATIVE_UPPER = {"Polo", "Shirt", "Hoodie", "Sweater", "Jacket", "Blazer", "Coat", "Sports Jacket", "Dresses"}
+FASHION_MODEL = "valentinafevu/yolos-fashionpedia"
+CLIP_MODEL = "openai/clip-vit-base-patch32"
+
+PROMPTS = [
+    "a regular short sleeve crew neck T-shirt",
+    "a sleeveless tank top or camisole",
+    "a polo shirt with a collar",
+    "a soccer jersey, basketball jersey, baseball jersey, or sports jersey",
+    "a button-up shirt or blouse",
+    "a sweatshirt or hoodie",
+    "a sweater or knit top",
+    "a jacket or coat",
+    "a dress or one-piece outfit",
+]
+PROMPT_NAMES = ["tshirt", "tank", "polo", "sports_jersey", "button_up", "sweatshirt", "sweater", "jacket", "dress"]
+
+UPPER_LABELS = {
+    "top, t-shirt, sweatshirt",
+    "shirt, blouse",
+    "sweater",
+    "cardigan",
+    "jacket",
+    "vest",
+    "coat",
+    "dress",
+    "jumpsuit",
+}
+TLIKE_LABEL = "top, t-shirt, sweatshirt"
 
 
 def load_metadata(root: Path) -> dict[str, dict[str, Any]]:
-    meta_path = root / "metadata.json"
-    if not meta_path.exists():
+    path = root / "metadata.json"
+    if not path.exists():
         return {}
     try:
-        rows = json.loads(meta_path.read_text(encoding="utf-8"))
+        rows = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -36,119 +66,91 @@ def load_metadata(root: Path) -> dict[str, dict[str, Any]]:
 
 
 def font(size: int, bold: bool = False):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    ]
-    for p in candidates:
-        if Path(p).exists():
-            try:
-                return ImageFont.truetype(p, size=size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
+    p = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(p, size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 
-def clamp_box(box: tuple[float, float, float, float], w: int, h: int) -> tuple[int, int, int, int]:
+def expand(box: list[float], w: int, h: int, f: float = 0.10) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = box
+    bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
     return (
-        max(0, min(w - 1, int(x1))),
-        max(0, min(h - 1, int(y1))),
-        max(1, min(w, int(x2))),
-        max(1, min(h, int(y2))),
+        max(0, int(x1 - bw * f)),
+        max(0, int(y1 - bh * f)),
+        min(w, int(x2 + bw * f)),
+        min(h, int(y2 + bh * f)),
     )
 
 
-def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf: list[float] | None, w: int, h: int) -> tuple[tuple[int, int, int, int], str]:
-    px1, py1, px2, py2 = person_box
-    pw, ph = max(1.0, px2 - px1), max(1.0, py2 - py1)
-
-    def kp_ok(i: int) -> bool:
-        if xy is None or i >= len(xy):
-            return False
-        if conf is not None and i < len(conf) and float(conf[i]) < 0.25:
-            return False
-        return float(xy[i][0]) > 1 and float(xy[i][1]) > 1
-
-    if all(kp_ok(i) for i in (5, 6, 11, 12)):
-        pts = [xy[i] for i in (5, 6, 11, 12)]
-        xs = [float(p[0]) for p in pts]
-        shoulder_y = min(float(xy[5][1]), float(xy[6][1]))
-        hip_y = max(float(xy[11][1]), float(xy[12][1]))
-        torso_h = max(20.0, hip_y - shoulder_y)
-        torso_w = max(20.0, max(xs) - min(xs))
-        box = (
-            min(xs) - torso_w * 0.38,
-            shoulder_y - torso_h * 0.16,
-            max(xs) + torso_w * 0.38,
-            hip_y - torso_h * 0.03,
-        )
-        return clamp_box(box, w, h), "pose_shoulders_hips"
-
-    if kp_ok(5) and kp_ok(6):
-        sx1, sx2 = sorted([float(xy[5][0]), float(xy[6][0])])
-        sy = min(float(xy[5][1]), float(xy[6][1]))
-        sw = max(20.0, sx2 - sx1)
-        box = (sx1 - sw * 0.48, sy - ph * 0.04, sx2 + sw * 0.48, sy + ph * 0.43)
-        return clamp_box(box, w, h), "pose_shoulders"
-
-    box = (px1 + pw * 0.08, py1 + ph * 0.10, px2 - pw * 0.08, py1 + ph * 0.60)
-    return clamp_box(box, w, h), "person_geometry"
+def clip_scores(crops: list[Image.Image], processor, model) -> list[dict[str, float]]:
+    if not crops:
+        return []
+    inputs = processor(text=PROMPTS, images=crops, return_tensors="pt", padding=True)
+    with torch.inference_mode():
+        probs = torch.softmax(model(**inputs).logits_per_image, dim=1).cpu().tolist()
+    return [{PROMPT_NAMES[i]: float(row[i]) for i in range(len(row))} for row in probs]
 
 
-def classify_crops(crops: list[Image.Image], processor, model, batch_size: int = 12) -> list[dict[str, float]]:
-    outputs: list[dict[str, float]] = []
-    labels = {int(k): v for k, v in model.config.id2label.items()} if isinstance(model.config.id2label, dict) else model.config.id2label
-    for start in range(0, len(crops), batch_size):
-        batch = crops[start : start + batch_size]
-        inputs = processor(images=batch, return_tensors="pt")
-        with torch.inference_mode():
-            probs = torch.softmax(model(**inputs).logits, dim=-1).cpu()
-        for row in probs:
-            outputs.append({str(labels[i]): float(row[i]) for i in range(len(row))})
-    return outputs
+def rank_score(row: dict[str, Any]) -> float:
+    score = float(row.get("tshirt_prob") or 0.0) + max(-0.5, float(row.get("tshirt_margin") or 0.0))
+    if row.get("fashion_label") == TLIKE_LABEL:
+        score += 0.55
+    else:
+        score -= 0.40
+    if row.get("clip_top") == "tshirt":
+        score += 0.55
+    return score
 
 
-def make_sheet(rows: list[dict[str, Any]], image_root: Path, out_path: Path, accepted: bool) -> None:
-    cols, rcount = 4, 4
-    cell_w, cell_h, label_h = 500, 500, 92
-    canvas = Image.new("RGB", (cols * cell_w, rcount * cell_h), "white")
-    draw = ImageDraw.Draw(canvas)
-    f1, f2 = font(21, True), font(15, False)
-    for pos, row in enumerate(rows[: cols * rcount]):
-        rr, cc = divmod(pos, cols)
-        x0, y0 = cc * cell_w, rr * cell_h
-        path = image_root / row["source_name"]
-        try:
-            im = Image.open(path).convert("RGB")
-            ann = row.get("torso_box")
-            if ann:
-                d = ImageDraw.Draw(im)
-                x1, y1, x2, y2 = [int(v) for v in ann]
-                d.rectangle((x1, y1, x2, y2), outline="lime" if accepted else "red", width=max(3, im.width // 250))
-            fitted = ImageOps.contain(im, (cell_w - 8, cell_h - label_h - 8), Image.Resampling.LANCZOS)
-            ix = x0 + (cell_w - fitted.width) // 2
-            iy = y0 + label_h + (cell_h - label_h - fitted.height) // 2
-            canvas.paste(fitted, (ix, iy))
-        except Exception:
-            pass
-        draw.rectangle((x0, y0, x0 + cell_w - 1, y0 + cell_h - 1), outline="black", width=2)
-        draw.text((x0 + 8, y0 + 5), f"#{row.get('index','?')} {row.get('decision','')}", fill="black", font=f1)
-        draw.text((x0 + 8, y0 + 35), f"T={row.get('tshirt_prob',0):.2f} margin={row.get('margin',0):.2f} person={row.get('person_conf',0):.2f}", fill="black", font=f2)
-        draw.text((x0 + 8, y0 + 60), f"{row.get('crop_method','')} · @{row.get('handle','')}"[:57], fill="black", font=f2)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out_path, "JPEG", quality=88, optimize=True)
+def make_sheets(rows: list[dict[str, Any]], image_root: Path, out_dir: Path, prefix: str, limit: int) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = rows[:limit]
+    cols, per = 5, 25
+    cw, ch, lh = 420, 440, 94
+    f1, f2 = font(17, True), font(13, False)
+    sheets = 0
+    for start in range(0, len(rows), per):
+        chunk = rows[start:start + per]
+        canvas = Image.new("RGB", (cw * cols, ch * 5), "white")
+        draw = ImageDraw.Draw(canvas)
+        for pos, row in enumerate(chunk):
+            rr, cc = divmod(pos, cols)
+            x0, y0 = cc * cw, rr * ch
+            path = image_root / row["source_name"]
+            try:
+                im = Image.open(path).convert("RGB")
+                box = row.get("garment_box")
+                if box:
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    outline = "lime" if row.get("decision") == "accepted_tshirt" else "orange"
+                    ImageDraw.Draw(im).rectangle((x1, y1, x2, y2), outline=outline, width=max(3, im.width // 260))
+                fitted = ImageOps.contain(im, (cw - 8, ch - lh - 8), Image.Resampling.LANCZOS)
+                canvas.paste(fitted, (x0 + (cw - fitted.width) // 2, y0 + lh + (ch - lh - fitted.height) // 2))
+            except Exception:
+                pass
+            draw.rectangle((x0, y0, x0 + cw - 1, y0 + ch - 1), outline="black", width=2)
+            draw.text((x0 + 5, y0 + 4), f"#{row.get('index','?')} {row.get('decision','')}", fill="black", font=f1)
+            draw.text((x0 + 5, y0 + 28), f"{row.get('clip_top','')} T={row.get('tshirt_prob',0):.2f} m={row.get('tshirt_margin',0):.2f}", fill="black", font=f2)
+            draw.text((x0 + 5, y0 + 48), f"FP {row.get('fashion_label','')} {row.get('fashion_conf',0):.2f}"[:58], fill="black", font=f2)
+            draw.text((x0 + 5, y0 + 68), f"@{row.get('handle','')} · {row.get('city','')}"[:58], fill="black", font=f2)
+        sheets += 1
+        canvas.save(out_dir / f"{prefix}_{sheets:03d}.jpg", "JPEG", quality=87, optimize=True)
+    return sheets
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("root", nargs="?", default="source")
-    ap.add_argument("--out", default="vision_audit")
-    ap.add_argument("--tshirt-threshold", type=float, default=0.50)
-    ap.add_argument("--margin-threshold", type=float, default=0.10)
-    ap.add_argument("--person-conf", type=float, default=0.35)
-    ap.add_argument("--min-person-area", type=float, default=0.07)
-    ap.add_argument("--lightweight", action="store_true", help="Write only result metadata; skip image copies/contact sheets")
+    ap.add_argument("root", nargs="?", default="candidate_pool")
+    ap.add_argument("--out", default="garment_audit")
+    ap.add_argument("--det-threshold", type=float, default=0.18)
+    ap.add_argument("--min-garment-area", type=float, default=0.012)
+    ap.add_argument("--accept-prob", type=float, default=0.50)
+    ap.add_argument("--accept-margin", type=float, default=0.35)
+    ap.add_argument("--borderline-margin", type=float, default=0.05)
+    ap.add_argument("--review-limit", type=int, default=1200)
+    ap.add_argument("--lightweight", action="store_true")
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -157,71 +159,69 @@ def main() -> None:
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
-    if not args.lightweight:
-        for d in ("accepted", "rejected_top", "contact_sheets", "crops"):
-            (out / d).mkdir(parents=True, exist_ok=True)
 
     metadata = load_metadata(root)
-    paths = sorted([p for p in image_root.glob("*.jpg") if p.is_file()])
+    paths = sorted(image_root.glob("*.jpg"))
     if not paths:
         (out / "vision_results.json").write_text("[]", encoding="utf-8")
-        (out / "preliminary_rejections.json").write_text("[]", encoding="utf-8")
-        (out / "summary.json").write_text(json.dumps({"input_images": 0, "accepted_tshirts": 0}), encoding="utf-8")
-        print("No JPG images found; wrote empty results", flush=True)
+        (out / "summary.json").write_text(json.dumps({"input_images": 0}), encoding="utf-8")
         return
 
-    print(f"images={len(paths)}", flush=True)
-    pose = YOLO("yolo11n-pose.pt")
-    processor = AutoImageProcessor.from_pretrained(CLASSIFIER_REPO)
-    classifier = AutoModelForImageClassification.from_pretrained(CLASSIFIER_REPO)
-    classifier.eval()
+    print(f"input_images={len(paths)}", flush=True)
+    fashion_processor = AutoImageProcessor.from_pretrained(FASHION_MODEL)
+    fashion = AutoModelForObjectDetection.from_pretrained(FASHION_MODEL)
+    fashion.eval()
+    clip_processor = AutoProcessor.from_pretrained(CLIP_MODEL)
+    clip = AutoModelForZeroShotImageClassification.from_pretrained(CLIP_MODEL)
+    clip.eval()
 
-    candidate_rows: list[dict[str, Any]] = []
-    candidate_crops: list[Image.Image] = []
-    prelim_rejected: list[dict[str, Any]] = []
+    id2label = fashion.config.id2label
+    if isinstance(id2label, dict):
+        id2label = {int(k): v for k, v in id2label.items()}
 
-    # Stream pose results instead of materializing all result tensors at once. This keeps memory bounded
-    # and prevents the hosted runner shutdown seen when processing hundreds of photos in one list().
-    result_stream = pose.predict([str(p) for p in paths], imgsz=512, conf=args.person_conf, verbose=False, stream=True, device="cpu")
-    for seq, (path, res) in enumerate(zip(paths, result_stream), start=1):
+    rows: list[dict[str, Any]] = []
+    no_upper: list[dict[str, Any]] = []
+
+    for seq, path in enumerate(paths, start=1):
         try:
             im = Image.open(path).convert("RGB")
         except Exception as exc:
-            prelim_rejected.append({"source_name": path.name, "decision": "decode_error", "error": repr(exc)})
+            no_upper.append({"source_name": path.name, "reason": f"decode:{exc}"})
             continue
         w, h = im.size
-        image_area = float(w * h)
-        boxes = getattr(res, "boxes", None)
-        keypoints = getattr(res, "keypoints", None)
-        if boxes is None or len(boxes) == 0:
-            prelim_rejected.append({"source_name": path.name, "decision": "no_person"})
-            continue
+        area = float(max(1, w * h))
+        inputs = fashion_processor(images=im, return_tensors="pt")
+        with torch.inference_mode():
+            outputs = fashion(**inputs)
+        det = fashion_processor.post_process_object_detection(outputs, threshold=args.det_threshold, target_sizes=torch.tensor([[h, w]]))[0]
 
-        xyxys = boxes.xyxy.cpu().tolist()
-        bconfs = boxes.conf.cpu().tolist()
-        kxy = keypoints.xy.cpu().tolist() if keypoints is not None and keypoints.xy is not None else []
-        kconf = keypoints.conf.cpu().tolist() if keypoints is not None and keypoints.conf is not None else []
-
-        people: list[tuple[float, int]] = []
-        for i, b in enumerate(xyxys):
-            area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-            ratio = area / image_area if image_area else 0.0
-            if ratio >= args.min_person_area:
-                people.append((float(bconfs[i]) * math.sqrt(ratio), i))
-        people.sort(reverse=True)
-        if not people:
-            prelim_rejected.append({"source_name": path.name, "decision": "person_too_small"})
-            continue
-
-        meta = metadata.get(path.name, {})
-        for _, i in people[:2]:
-            xy = kxy[i] if i < len(kxy) else None
-            cf = kconf[i] if i < len(kconf) else None
-            torso_box, method = torso_from_pose(xyxys[i], xy, cf, w, h)
-            x1, y1, x2, y2 = torso_box
-            if x2 - x1 < 70 or y2 - y1 < 70:
+        candidates: list[tuple[dict[str, Any], Image.Image]] = []
+        for score, label_id, box_tensor in zip(det["scores"], det["labels"], det["boxes"]):
+            label = str(id2label[int(label_id)])
+            if label not in UPPER_LABELS:
                 continue
-            candidate_rows.append({
+            box = [float(v) for v in box_tensor.tolist()]
+            x1, y1, x2, y2 = box
+            area_ratio = max(0.0, x2 - x1) * max(0.0, y2 - y1) / area
+            if area_ratio < args.min_garment_area:
+                continue
+            cb = expand(box, w, h, 0.10)
+            crop = im.crop(cb)
+            if crop.width < 65 or crop.height < 65:
+                continue
+            candidates.append(({"fashion_label": label, "fashion_conf": float(score), "garment_box": box, "crop_box": list(cb)}, crop))
+
+        if not candidates:
+            no_upper.append({"source_name": path.name, "reason": "no_clear_upper_garment"})
+            continue
+
+        probs = clip_scores([crop for _, crop in candidates], clip_processor, clip)
+        meta = metadata.get(path.name, {})
+        best: dict[str, Any] | None = None
+        for (base, _), prob in zip(candidates, probs):
+            order = sorted(prob, key=prob.get, reverse=True)
+            top, second = order[0], order[1]
+            row = {
                 "index": int(meta.get("index") or seq),
                 "source_name": path.name,
                 "city": meta.get("city"),
@@ -232,93 +232,68 @@ def main() -> None:
                 "shortcode": meta.get("shortcode"),
                 "child_index": meta.get("child_index"),
                 "is_carousel_child": meta.get("is_carousel_child"),
-                "person_conf": float(bconfs[i]),
-                "person_box": [float(v) for v in xyxys[i]],
-                "torso_box": list(torso_box),
-                "crop_method": method,
-            })
-            candidate_crops.append(im.crop(torso_box))
+                **base,
+                "clip_top": top,
+                "clip_top_prob": prob[top],
+                "clip_second": second,
+                "clip_second_prob": prob[second],
+                "tshirt_prob": prob["tshirt"],
+                "tshirt_margin": prob["tshirt"] - max(v for k, v in prob.items() if k != "tshirt"),
+                "clip_probs": prob,
+            }
+            row["rank_score"] = rank_score(row)
+            if best is None or row["rank_score"] > best["rank_score"]:
+                best = row
 
-    print(f"candidate_torsos={len(candidate_crops)} prelim_rejected={len(prelim_rejected)}", flush=True)
-    probs = classify_crops(candidate_crops, processor, classifier)
-    candidate_crops.clear()
+        if best is None:
+            continue
+        high = best["fashion_label"] == TLIKE_LABEL and best["clip_top"] == "tshirt" and best["tshirt_prob"] >= args.accept_prob and best["tshirt_margin"] >= args.accept_margin
+        borderline = best["fashion_label"] == TLIKE_LABEL and best["clip_top"] == "tshirt" and best["tshirt_margin"] >= args.borderline_margin
+        best["decision"] = "accepted_tshirt" if high else ("borderline_tshirt" if borderline else "rejected")
+        rows.append(best)
 
-    best_by_image: dict[str, dict[str, Any]] = {}
-    for row, prob in zip(candidate_rows, probs):
-        tshirt = float(prob.get("T-shirt", 0.0))
-        negatives = sorted(((name, float(prob.get(name, 0.0))) for name in NEGATIVE_UPPER), key=lambda x: x[1], reverse=True)
-        best_neg_name, best_neg_prob = negatives[0] if negatives else ("", 0.0)
-        margin = tshirt - best_neg_prob
-        top_label, top_prob = max(prob.items(), key=lambda kv: kv[1])
-        combined = tshirt * (0.7 + 0.3 * float(row["person_conf"]))
-        row.update({
-            "classifier_top": top_label,
-            "classifier_top_prob": float(top_prob),
-            "tshirt_prob": tshirt,
-            "best_negative": best_neg_name,
-            "best_negative_prob": best_neg_prob,
-            "margin": margin,
-            "combined_score": combined,
-            "classifier_probs": prob,
-        })
-        prev = best_by_image.get(row["source_name"])
-        if prev is None or row["combined_score"] > prev["combined_score"]:
-            best_by_image[row["source_name"]] = row
+        if seq % 50 == 0:
+            hi = sum(r.get("decision") == "accepted_tshirt" for r in rows)
+            bord = sum(r.get("decision") == "borderline_tshirt" for r in rows)
+            print(f"processed={seq}/{len(paths)} high={hi} borderline={bord}", flush=True)
 
-    accepted: list[dict[str, Any]] = []
-    rejected_scored: list[dict[str, Any]] = []
-    for row in best_by_image.values():
-        ok = row["classifier_top"] == "T-shirt" and row["tshirt_prob"] >= args.tshirt_threshold and row["margin"] >= args.margin_threshold
-        row["decision"] = "accepted_tshirt" if ok else "classifier_reject"
-        (accepted if ok else rejected_scored).append(row)
+    high = [r for r in rows if r["decision"] == "accepted_tshirt"]
+    borderline = [r for r in rows if r["decision"] == "borderline_tshirt"]
+    rejected = [r for r in rows if r["decision"] == "rejected"]
+    high.sort(key=lambda r: (float(r.get("timestamp") or 0), r["rank_score"]), reverse=True)
+    borderline.sort(key=lambda r: r["rank_score"], reverse=True)
+    rejected.sort(key=lambda r: r["rank_score"], reverse=True)
+    review_queue = sorted(high + borderline + rejected, key=lambda r: r["rank_score"], reverse=True)
 
-    accepted.sort(key=lambda r: ((r.get("timestamp") or 0), r["combined_score"]), reverse=True)
-    rejected_scored.sort(key=lambda r: r["tshirt_prob"], reverse=True)
+    all_rows = high + borderline + rejected
+    (out / "vision_results.json").write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "review_queue.json").write_text(json.dumps(review_queue[:args.review_limit], ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "preliminary_rejections.json").write_text(json.dumps(no_upper, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if not args.lightweight:
-        for n, row in enumerate(accepted, start=1):
-            src = image_root / row["source_name"]
-            shutil.copy2(src, out / "accepted" / f"{n:04d}_{row['source_name']}")
-            try:
-                im = Image.open(src).convert("RGB")
-                crop = im.crop(tuple(int(v) for v in row["torso_box"]))
-                crop.save(out / "crops" / f"{n:04d}_{row['source_name']}", "JPEG", quality=90)
-            except Exception:
-                pass
-        for n, row in enumerate(rejected_scored[:96], start=1):
-            shutil.copy2(image_root / row["source_name"], out / "rejected_top" / f"{n:04d}_{row['source_name']}")
-        for start in range(0, len(accepted), 16):
-            make_sheet(accepted[start:start+16], image_root, out / "contact_sheets" / f"accepted_{start//16+1:03d}.jpg", True)
-        for start in range(0, min(len(rejected_scored), 96), 16):
-            make_sheet(rejected_scored[start:start+16], image_root, out / "contact_sheets" / f"borderline_rejected_{start//16+1:03d}.jpg", False)
-
-    fields = [
-        "index", "source_name", "decision", "city", "handle", "source_url", "timestamp", "parent_shortcode", "shortcode", "child_index", "is_carousel_child",
-        "person_conf", "crop_method", "classifier_top", "classifier_top_prob", "tshirt_prob", "best_negative", "best_negative_prob", "margin", "combined_score", "person_box", "torso_box",
-    ]
-    all_rows = accepted + rejected_scored
+    fields = ["index", "source_name", "decision", "rank_score", "city", "handle", "source_url", "timestamp", "parent_shortcode", "shortcode", "child_index", "is_carousel_child", "fashion_label", "fashion_conf", "clip_top", "clip_top_prob", "clip_second", "clip_second_prob", "tshirt_prob", "tshirt_margin", "garment_box", "crop_box"]
     with (out / "vision_results.csv").open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
-    (out / "vision_results.json").write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    (out / "preliminary_rejections.json").write_text(json.dumps(prelim_rejected, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    sheet_count = 0
+    if not args.lightweight:
+        sheet_count += make_sheets(high, image_root, out / "contact_sheets", "high_confidence", 500)
+        sheet_count += make_sheets(borderline, image_root, out / "contact_sheets", "borderline", 700)
+        sheet_count += make_sheets(review_queue, image_root, out / "review_sheets", "ranked_review", args.review_limit)
 
     summary = {
         "input_images": len(paths),
-        "candidate_torsos": len(candidate_rows),
-        "images_with_scored_torso": len(best_by_image),
-        "accepted_tshirts": len(accepted),
-        "classifier_rejected": len(rejected_scored),
-        "preliminary_rejected": len(prelim_rejected),
-        "thresholds": {
-            "tshirt_probability": args.tshirt_threshold,
-            "margin": args.margin_threshold,
-            "person_conf": args.person_conf,
-            "min_person_area_ratio": args.min_person_area,
-        },
-        "method": "Streaming YOLO11 pose person localization -> pose-derived torso crop -> independent ViT clothing classifier. Acceptance requires T-shirt as top class plus probability and margin thresholds.",
-        "lightweight": args.lightweight,
+        "images_with_upper_garment": len(rows),
+        "no_clear_upper_garment": len(no_upper),
+        "high_confidence_tshirts": len(high),
+        "borderline_tshirts": len(borderline),
+        "rejected": len(rejected),
+        "clip_top_counts": dict(Counter(r["clip_top"] for r in rows)),
+        "fashion_label_counts": dict(Counter(r["fashion_label"] for r in rows)),
+        "thresholds": {"detector": args.det_threshold, "min_garment_area": args.min_garment_area, "accept_probability": args.accept_prob, "accept_margin": args.accept_margin, "borderline_margin": args.borderline_margin},
+        "review_sheet_count": sheet_count,
+        "method": "FashionPedia garment detection first, then CLIP comparison among T-shirt/tank/polo/sports jersey/button-up/sweatshirt/sweater/jacket/dress. High-confidence acceptance requires detector and classifier agreement. Borderline candidates require human visual QA.",
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
