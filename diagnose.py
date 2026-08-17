@@ -23,6 +23,10 @@ UA = (
 )
 
 
+def emit(row: dict) -> None:
+    print(json.dumps(row, ensure_ascii=False), flush=True)
+
+
 def inspect_html(name: str, url: str) -> dict:
     row = {"name": name, "url": url}
     try:
@@ -30,7 +34,7 @@ def inspect_html(name: str, url: str) -> dict:
             url,
             headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
             impersonate="chrome",
-            timeout=30,
+            timeout=12,
             allow_redirects=True,
         )
         row.update({"status": r.status_code, "final_url": str(r.url), "bytes": len(r.content)})
@@ -51,13 +55,14 @@ def inspect_html(name: str, url: str) -> dict:
         links = [urljoin(str(r.url), a.get("href")) for a in soup.find_all("a", href=True)]
         row["img_count"] = len(set(imgs))
         row["post_link_count"] = len({x for x in links if re.search(r"/(?:p|reel)/", x)})
-        row["sample_images"] = list(dict.fromkeys(imgs))[:5]
-        row["sample_post_links"] = list(dict.fromkeys(x for x in links if re.search(r"/(?:p|reel)/", x)))[:5]
+        row["sample_images"] = list(dict.fromkeys(imgs))[:8]
+        row["sample_post_links"] = list(dict.fromkeys(x for x in links if re.search(r"/(?:p|reel)/", x)))[:8]
         with open(f"diag_{name}.html", "w", encoding="utf-8") as f:
             f.write(r.text[:2_000_000])
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
         row["traceback"] = traceback.format_exc(limit=4)
+    emit(row)
     return row
 
 
@@ -73,6 +78,8 @@ def inspect_instaloader() -> dict:
             save_metadata=False,
             compress_json=False,
             quiet=True,
+            max_connection_attempts=1,
+            request_timeout=8.0,
         )
         profile = instaloader.Profile.from_username(loader.context, "inthestreetsla")
         row["profile_id"] = profile.userid
@@ -94,16 +101,17 @@ def inspect_instaloader() -> dict:
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
         row["traceback"] = traceback.format_exc(limit=5)
+    emit(row)
     return row
 
 
 def main() -> int:
-    results = [inspect_html(name, url) for name, url in TARGETS]
+    results = []
+    for name, url in TARGETS:
+        results.append(inspect_html(name, url))
     results.append(inspect_instaloader())
-    print(json.dumps(results, indent=2, ensure_ascii=False))
     with open("diagnostic_results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
-    # Diagnostic workflow should finish successfully even if individual routes fail.
     return 0
 
 
