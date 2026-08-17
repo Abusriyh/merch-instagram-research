@@ -14,6 +14,7 @@ from PIL import Image, ImageOps
 HANDLE = os.environ["HANDLE"].strip().lstrip("@")
 CITY = os.environ["CITY"].strip()
 KIND = os.environ.get("KIND", "fashion").strip()
+MAX_MEDIA = int(os.environ.get("MAX_MEDIA", "180"))
 OUT = Path("batch") / CITY / HANDLE
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -49,35 +50,91 @@ def caption_from_node(node: dict[str, Any]) -> str:
     return ""
 
 
+def counts_from_node(node: dict[str, Any]) -> tuple[int | None, int | None]:
+    like_count = None
+    for key in ("edge_liked_by", "edge_media_preview_like"):
+        val = node.get(key)
+        if isinstance(val, dict) and val.get("count") is not None:
+            like_count = val.get("count")
+            break
+    comment_count = None
+    val = node.get("edge_media_to_comment")
+    if isinstance(val, dict):
+        comment_count = val.get("count")
+    return like_count, comment_count
+
+
+def photo_item(
+    media_node: dict[str, Any],
+    parent: dict[str, Any],
+    parent_rank: int,
+    child_index: int | None,
+) -> dict[str, Any] | None:
+    """Normalize one still image. Video/Reel thumbnails are deliberately excluded."""
+    if bool(media_node.get("is_video")):
+        return None
+    display = media_node.get("display_url") or media_node.get("thumbnail_src")
+    if not isinstance(display, str) or not display:
+        return None
+    parent_shortcode = str(parent.get("shortcode") or f"post{parent_rank}")
+    child_shortcode = media_node.get("shortcode")
+    media_key = str(child_shortcode or f"{parent_shortcode}_c{(child_index or 0):02d}")
+    like_count, comment_count = counts_from_node(parent)
+    return {
+        "shortcode": media_key,
+        "parent_shortcode": parent_shortcode,
+        "parent_rank": parent_rank,
+        "child_index": child_index,
+        "display_url": display,
+        "thumbnail": media_node.get("thumbnail_src"),
+        "timestamp": parent.get("taken_at_timestamp"),
+        "type": media_node.get("__typename") or parent.get("__typename"),
+        "is_video": False,
+        "like_count": like_count,
+        "comment_count": comment_count,
+        "caption": caption_from_node(parent),
+        "is_carousel_child": child_index is not None,
+    }
+
+
 def normalize_instagram_user(user: dict[str, Any]) -> dict[str, Any]:
     timeline = user.get("edge_owner_to_timeline_media") or {}
     edges = timeline.get("edges") or []
     posts: list[dict[str, Any]] = []
-    for edge in edges[:12]:
-        node = edge.get("node") if isinstance(edge, dict) else None
-        if not isinstance(node, dict):
+    parent_posts_seen = 0
+    carousel_posts = 0
+    skipped_video_media = 0
+
+    for parent_rank, edge in enumerate(edges[:12], start=1):
+        parent = edge.get("node") if isinstance(edge, dict) else None
+        if not isinstance(parent, dict):
             continue
-        like_count = None
-        for key in ("edge_liked_by", "edge_media_preview_like"):
-            val = node.get(key)
-            if isinstance(val, dict) and val.get("count") is not None:
-                like_count = val.get("count")
-                break
-        comment_count = None
-        val = node.get("edge_media_to_comment")
-        if isinstance(val, dict):
-            comment_count = val.get("count")
-        posts.append({
-            "shortcode": node.get("shortcode"),
-            "display_url": node.get("display_url") or node.get("thumbnail_src"),
-            "thumbnail": node.get("thumbnail_src"),
-            "timestamp": node.get("taken_at_timestamp"),
-            "type": node.get("__typename"),
-            "is_video": bool(node.get("is_video")),
-            "like_count": like_count,
-            "comment_count": comment_count,
-            "caption": caption_from_node(node),
-        })
+        parent_posts_seen += 1
+        sidecar = ((parent.get("edge_sidecar_to_children") or {}).get("edges") or [])
+        if sidecar:
+            carousel_posts += 1
+            for child_index, child_edge in enumerate(sidecar, start=1):
+                child = child_edge.get("node") if isinstance(child_edge, dict) else None
+                if not isinstance(child, dict):
+                    continue
+                item = photo_item(child, parent, parent_rank, child_index)
+                if item is None:
+                    if bool(child.get("is_video")):
+                        skipped_video_media += 1
+                    continue
+                posts.append(item)
+                if len(posts) >= MAX_MEDIA:
+                    break
+        else:
+            item = photo_item(parent, parent, parent_rank, None)
+            if item is None:
+                if bool(parent.get("is_video")):
+                    skipped_video_media += 1
+            else:
+                posts.append(item)
+        if len(posts) >= MAX_MEDIA:
+            break
+
     return {
         "success": True,
         "source": "instagram_web_profile_info",
@@ -88,6 +145,10 @@ def normalize_instagram_user(user: dict[str, Any]) -> dict[str, Any]:
         "posts_count": timeline.get("count"),
         "is_private": user.get("is_private"),
         "posts": posts,
+        "parent_posts_seen": parent_posts_seen,
+        "carousel_posts": carousel_posts,
+        "expanded_photo_candidates": len(posts),
+        "skipped_video_media": skipped_video_media,
         "has_next_page": ((timeline.get("page_info") or {}).get("has_next_page")),
         "end_cursor": ((timeline.get("page_info") or {}).get("end_cursor")),
     }
@@ -191,9 +252,10 @@ def normalize_image(blob: bytes, path: Path) -> tuple[int, int, str] | None:
     try:
         im = Image.open(io.BytesIO(blob))
         im = ImageOps.exif_transpose(im).convert("RGB")
-        im.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+        # 1000px is ample for clothing classification and keeps the expanded pool manageable.
+        im.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
         w, h = im.size
-        im.save(path, "JPEG", quality=85, optimize=True, progressive=True)
+        im.save(path, "JPEG", quality=82, optimize=True, progressive=True)
         sha = hashlib.sha256(path.read_bytes()).hexdigest()
         return w, h, sha
     except Exception:
@@ -229,6 +291,10 @@ def main() -> None:
             "is_private": data.get("is_private"),
             "has_next_page": data.get("has_next_page"),
             "end_cursor": data.get("end_cursor"),
+            "parent_posts_seen": data.get("parent_posts_seen"),
+            "carousel_posts": data.get("carousel_posts"),
+            "expanded_photo_candidates": data.get("expanded_photo_candidates"),
+            "skipped_video_media": data.get("skipped_video_media"),
         }
         if data.get("instagram_error"):
             report["errors"].append(f"instagram_fallback:{data.get('instagram_error')}")
@@ -236,11 +302,13 @@ def main() -> None:
             report["errors"].append("private_profile")
             meta_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             return
+
         posts = data.get("posts") or []
-        for idx, post in enumerate(posts[:12]):
+        for idx, post in enumerate(posts[:MAX_MEDIA]):
             if not isinstance(post, dict):
                 continue
-            shortcode = str(post.get("shortcode") or f"post{idx}")
+            shortcode = str(post.get("shortcode") or f"media{idx}")
+            parent_shortcode = str(post.get("parent_shortcode") or shortcode)
             candidates = [post.get("display_url"), post.get("thumbnail"), post.get("display_proxy")]
             blob = None
             used = None
@@ -253,7 +321,8 @@ def main() -> None:
             if not blob:
                 report["errors"].append(f"media_failed:{shortcode}")
                 continue
-            image_path = OUT / f"{idx:02d}_{shortcode}.jpg"
+            safe_key = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in shortcode)[:80]
+            image_path = OUT / f"{idx:03d}_{safe_key}.jpg"
             info = normalize_image(blob, image_path)
             if not info:
                 report["errors"].append(f"decode_failed:{shortcode}")
@@ -266,12 +335,16 @@ def main() -> None:
                 "handle": HANDLE,
                 "city": CITY,
                 "kind": KIND,
-                "profile_rank": idx + 1,
+                "profile_rank": post.get("parent_rank") or (idx + 1),
+                "media_rank": idx + 1,
                 "shortcode": shortcode,
-                "source_url": f"https://www.instagram.com/p/{shortcode}/",
+                "parent_shortcode": parent_shortcode,
+                "child_index": post.get("child_index"),
+                "is_carousel_child": bool(post.get("is_carousel_child")),
+                "source_url": f"https://www.instagram.com/p/{parent_shortcode}/",
                 "timestamp": post.get("timestamp"),
                 "post_type": post.get("type"),
-                "is_video": bool(post.get("is_video")),
+                "is_video": False,
                 "like_count": post.get("like_count"),
                 "comment_count": post.get("comment_count"),
                 "caption": caption[:1200],
@@ -291,6 +364,9 @@ def main() -> None:
         "city": CITY,
         "ok": report["ok"],
         "source": report.get("profile", {}).get("source"),
+        "parent_posts": report.get("profile", {}).get("parent_posts_seen"),
+        "carousel_posts": report.get("profile", {}).get("carousel_posts"),
+        "candidate_photos": report.get("profile", {}).get("expanded_photo_candidates"),
         "downloaded": len(report["items"]),
         "errors": report["errors"][:3],
     }, ensure_ascii=False), flush=True)
