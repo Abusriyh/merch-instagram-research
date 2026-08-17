@@ -27,10 +27,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Download challenging jraffshoots source batch
+      - name: Download Watching New York street-style source batch
         run: |
           mkdir -p source
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/9274341330/zip" > batch.zip
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/9274325436/zip" > batch.zip
           unzip -q batch.zip -d source
           echo "jpg=$(find source -iname '*.jpg' | wc -l)"
       - name: Install CPU vision stack
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: garment-filter-probe
+          name: garment-filter-probe-nyc
           path: garment_probe/
           if-no-files-found: warn
           retention-days: 7
