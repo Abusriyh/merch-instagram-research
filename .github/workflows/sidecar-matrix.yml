@@ -1,0 +1,44 @@
+name: Instagram sidecar matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'inspect_sidecar_one.py'
+      - '.github/workflows/sidecar-matrix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    strategy:
+      fail-fast: false
+      matrix:
+        handle:
+          - watchingnewyork
+          - genstreetstyle
+          - ballardstreetstyle
+          - cpplunkett
+          - mikeando.photo
+          - jraffshoots
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - name: Inspect ${{ matrix.handle }}
+        env:
+          HANDLE: ${{ matrix.handle }}
+        run: python inspect_sidecar_one.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sidecar-${{ matrix.handle }}
+          path: sidecar_${{ matrix.handle }}.json
+          if-no-files-found: warn
+          retention-days: 7
