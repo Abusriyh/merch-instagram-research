@@ -1,0 +1,31 @@
+name: Pixnoy profile ID probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_pixnoy_profile.py'
+      - '.github/workflows/pixnoy-profile-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0 beautifulsoup4==4.13.4
+      - run: python probe_pixnoy_profile.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pixnoy-profile-probe
+          path: pixnoy_profile_probe.json
+          if-no-files-found: warn
+          retention-days: 7
