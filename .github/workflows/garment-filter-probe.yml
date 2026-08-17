@@ -36,15 +36,8 @@ jobs:
       - name: Install CPU vision stack
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install pillow==11.3.0 transformers huggingface_hub ultralytics
-      - name: Download FashionPedia model weights
-        run: |
-          python - <<'PY'
-          from huggingface_hub import hf_hub_download
-          p = hf_hub_download(repo_id='AltaDaily/yolo26n-fashionpedia', filename='best.pt', local_dir='AltaDaily/yolo26n-fashionpedia')
-          print('FashionPedia weights:', p)
-          PY
-      - name: Run FashionPedia plus CLIP probe
+          pip install pillow==11.3.0 transformers huggingface_hub
+      - name: Run public FashionPedia YOLOS plus CLIP probe
         run: python probe_garment_filter.py
       - uses: actions/upload-artifact@v4
         if: always()
