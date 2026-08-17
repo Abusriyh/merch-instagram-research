@@ -1,0 +1,41 @@
+name: Instagram feed count probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_feed_count.py'
+      - '.github/workflows/feed-count-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.handle }} count=${{ matrix.count }}
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        handle: [inthestreetsla, cpplunkett, watchingnewyork, streetgeist, atxstreetstyle, ballardstreetstyle]
+        count: [12, 24, 50]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - name: Probe one first page
+        env:
+          HANDLE: ${{ matrix.handle }}
+          COUNT: ${{ matrix.count }}
+        run: python probe_feed_count.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: feed-count-${{ matrix.handle }}-${{ matrix.count }}
+          path: feed_count_result.json
+          retention-days: 7
