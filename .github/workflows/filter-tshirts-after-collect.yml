@@ -1,0 +1,123 @@
+name: Build US T-shirt 500
+
+on:
+  workflow_run:
+    workflows: ["Collect US fashion 500"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Collect US fashion 500 run ID (optional for manual runs)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  CUDA_VISIBLE_DEVICES: ''
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Resolve source collection run
+        id: source
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          elif [ -n "${{ inputs.source_run_id }}" ]; then
+            RUN_ID="${{ inputs.source_run_id }}"
+          else
+            RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/collect-500.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful collection run found" >&2
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using collection run $RUN_ID"
+
+      - name: Download every account batch from collection run
+        shell: bash
+        run: |
+          mkdir -p collected artifact_zips
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${{ steps.source.outputs.run_id }}/artifacts?per_page=100" --paginate \
+            --jq '.artifacts[] | select(.name | startswith("batch-")) | [.id,.name] | @tsv' > artifacts.tsv
+          COUNT=$(wc -l < artifacts.tsv | tr -d ' ')
+          echo "batch artifacts: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No batch artifacts found" >&2
+            exit 1
+          fi
+          while IFS=$'\t' read -r ID NAME; do
+            echo "Downloading $NAME ($ID)"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > "artifact_zips/${ID}.zip"
+            unzip -q -o "artifact_zips/${ID}.zip" -d collected
+          done < artifacts.tsv
+          echo "meta files: $(find collected -name 'batch_meta_*.json' | wc -l)"
+          echo "jpg files: $(find collected -iname '*.jpg' | wc -l)"
+
+      - name: Merge and dedupe full candidate pool
+        run: |
+          pip install pillow==11.3.0
+          python merge_candidates.py collected --out candidate_pool
+          cat candidate_pool/summary.json
+
+      - name: Install CPU-only T-shirt vision stack
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install huggingface_hub transformers ultralytics
+          python - <<'PY'
+          import torch
+          print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())
+          PY
+
+      - name: Gate candidates by visibly worn T-shirt
+        run: |
+          python vision_filter.py candidate_pool --out vision_audit
+          cat vision_audit/summary.json
+
+      - name: Select newest 500 only after T-shirt gate
+        run: |
+          python finalize_tshirts.py candidate_pool vision_audit --out final_tshirts --limit 500
+          cat final_tshirts/summary.json
+
+      - name: Attach QA diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p final_tshirts/qa
+          cp -f candidate_pool/summary.json final_tshirts/qa/candidate_pool_summary.json 2>/dev/null || true
+          cp -f vision_audit/summary.json final_tshirts/qa/vision_summary.json 2>/dev/null || true
+          cp -f vision_audit/vision_results.csv final_tshirts/qa/vision_results.csv 2>/dev/null || true
+          cp -f vision_audit/preliminary_rejections.json final_tshirts/qa/preliminary_rejections.json 2>/dev/null || true
+          if [ -d vision_audit/contact_sheets ]; then
+            mkdir -p final_tshirts/qa/vision_contact_sheets
+            cp -f vision_audit/contact_sheets/*.jpg final_tshirts/qa/vision_contact_sheets/ 2>/dev/null || true
+          fi
+
+      - name: Upload T-shirt-only research sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-tshirts-500
+          path: final_tshirts/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 4
