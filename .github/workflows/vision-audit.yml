@@ -1,11 +1,6 @@
 name: Vision audit T-shirt filter
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'vision_filter.py'
-      - '.github/workflows/vision-audit.yml'
   workflow_dispatch:
 
 permissions:
@@ -32,10 +27,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install pillow==11.3.0 huggingface_hub transformers ultralytics
-          python - <<'PY'
-          import torch
-          print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())
-          PY
       - name: Download latest US fashion panel artifact
         run: |
           ARTIFACT_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" --jq '[.artifacts[] | select(.name=="us-fashion-500" and (.expired|not))] | sort_by(.created_at) | reverse | .[0].id')
@@ -43,11 +34,9 @@ jobs:
             echo "No us-fashion-500 artifact found" >&2
             exit 1
           fi
-          echo "Using artifact id $ARTIFACT_ID"
           gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > source.zip
           mkdir -p source
           unzip -q source.zip -d source
-          find source -maxdepth 2 -type f | sed -n '1,20p'
       - name: Run conservative worn T-shirt filter
         run: python vision_filter.py source --out vision_audit
       - name: Upload vision QA artifact
