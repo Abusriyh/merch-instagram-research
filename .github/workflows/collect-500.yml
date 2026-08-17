@@ -1,0 +1,152 @@
+name: Collect US fashion 500
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'collect_account.py'
+      - 'merge_batches.py'
+      - '.github/workflows/collect-500.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  collect:
+    name: collect ${{ matrix.city }} @${{ matrix.handle }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include:
+          # New York City
+          - {city: new_york, handle: watchingnewyork, kind: street_curator}
+          - {city: new_york, handle: nyc_looks, kind: street_curator}
+          - {city: new_york, handle: karyastreetstyle, kind: street_curator}
+          - {city: new_york, handle: coffeecameranyc, kind: street_curator}
+          - {city: new_york, handle: melodiejeng, kind: fashion_photographer}
+          - {city: new_york, handle: melwearswhat, kind: fashion_creator}
+          - {city: new_york, handle: snapmyfits, kind: street_curator}
+
+          # Los Angeles
+          - {city: los_angeles, handle: streetgeist, kind: street_curator}
+          - {city: los_angeles, handle: sincerelyjules, kind: fashion_creator}
+          - {city: los_angeles, handle: aimeesong, kind: fashion_creator}
+          - {city: los_angeles, handle: rocky_barnes, kind: fashion_creator}
+          - {city: los_angeles, handle: madeleinecwhite, kind: fashion_creator}
+          - {city: los_angeles, handle: youngcouture_, kind: fashion_creator}
+          - {city: los_angeles, handle: imjennim, kind: fashion_creator}
+
+          # Chicago
+          - {city: chicago, handle: cpplunkett, kind: street_photographer}
+          - {city: chicago, handle: stylecadenza, kind: fashion_creator}
+          - {city: chicago, handle: stylebywale, kind: fashion_creator}
+          - {city: chicago, handle: opeoluwa_oos, kind: fashion_creator}
+          - {city: chicago, handle: redsolesandredwine, kind: fashion_creator}
+          - {city: chicago, handle: mikeando.photo, kind: photographer}
+          - {city: chicago, handle: hannahjiemei, kind: fashion_creator}
+
+          # Dallas
+          - {city: dallas, handle: natalie_keinan, kind: fashion_creator}
+          - {city: dallas, handle: lifestylebylaura, kind: fashion_creator}
+          - {city: dallas, handle: mscreativediva, kind: fashion_creator}
+          - {city: dallas, handle: ms_kita_renee, kind: fashion_creator}
+          - {city: dallas, handle: kavita.rimal, kind: fashion_creator}
+          - {city: dallas, handle: cavinselects, kind: mens_style}
+          - {city: dallas, handle: malloryleerichardson, kind: fashion_creator}
+
+          # Austin
+          - {city: austin, handle: atxstreetstyle, kind: street_curator}
+          - {city: austin, handle: riyapatel_, kind: fashion_creator}
+          - {city: austin, handle: so_narly, kind: fashion_creator}
+          - {city: austin, handle: bijpatel, kind: fashion_creator}
+          - {city: austin, handle: tanwithsan, kind: fashion_creator}
+          - {city: austin, handle: skylarbantz, kind: fashion_creator}
+          - {city: austin, handle: joplacencio, kind: fashion_creator}
+
+          # Miami
+          - {city: miami, handle: genstreetstyle, kind: street_curator}
+          - {city: miami, handle: sincerelymvu, kind: fashion_creator}
+          - {city: miami, handle: victoriaruiz, kind: fashion_creator}
+          - {city: miami, handle: imnotsorrydarling, kind: fashion_creator}
+          - {city: miami, handle: anaireisa, kind: fashion_creator}
+          - {city: miami, handle: andyfaerman, kind: fashion_creator}
+          - {city: miami, handle: riamichelle, kind: fashion_creator}
+
+          # Seattle
+          - {city: seattle, handle: ballardstreetstyle, kind: street_curator}
+          - {city: seattle, handle: officialdiydan, kind: mens_style}
+          - {city: seattle, handle: lastseenwearing, kind: fashion_creator}
+          - {city: seattle, handle: emmasedition, kind: fashion_creator}
+          - {city: seattle, handle: mehak.pahwa, kind: fashion_creator}
+          - {city: seattle, handle: seattlesalvage, kind: street_fashion}
+          - {city: seattle, handle: espressoandmartini, kind: fashion_creator}
+
+          # Atlanta
+          - {city: atlanta, handle: jraffshoots, kind: street_photographer}
+          - {city: atlanta, handle: brookeellison, kind: fashion_creator}
+          - {city: atlanta, handle: yaniqueduke, kind: fashion_creator}
+          - {city: atlanta, handle: laurenlefevre, kind: fashion_creator}
+          - {city: atlanta, handle: niyamarie_, kind: fashion_creator}
+          - {city: atlanta, handle: kiarranorman, kind: fashion_creator}
+          - {city: atlanta, handle: itsevetterenee, kind: fashion_creator}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install collector dependencies
+        run: pip install curl_cffi==0.13.0 pillow==11.3.0
+      - name: Collect recent public media
+        env:
+          HANDLE: ${{ matrix.handle }}
+          CITY: ${{ matrix.city }}
+          KIND: ${{ matrix.kind }}
+        run: python collect_account.py
+      - name: Upload account batch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-${{ matrix.city }}-${{ matrix.handle }}
+          path: batch/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+  merge:
+    name: merge newest balanced 500
+    needs: collect
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install merger dependencies
+        run: pip install pillow==11.3.0
+      - name: Download all usable batches
+        uses: actions/download-artifact@v4
+        with:
+          pattern: batch-*
+          path: collected
+          merge-multiple: true
+      - name: Dedupe, balance and select 500
+        run: python merge_batches.py collected --limit 500
+      - name: Upload final research panel
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-fashion-500
+          path: final/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 4
