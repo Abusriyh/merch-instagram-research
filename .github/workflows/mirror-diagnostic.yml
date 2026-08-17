@@ -1,0 +1,38 @@
+name: Instagram mirror diagnostic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'diagnose_mirrors.py'
+      - '.github/workflows/mirror-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-mirrors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install beautifulsoup4==4.13.4 curl_cffi==0.13.0
+      - name: Probe mirrors and search forms
+        run: python diagnose_mirrors.py
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirror-diagnostic
+          path: |
+            mirror_diagnostic_results.json
+            mirror_*.html
+          if-no-files-found: warn
+          retention-days: 7
