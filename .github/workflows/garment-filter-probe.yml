@@ -1,0 +1,48 @@
+name: Garment-first T-shirt filter probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_garment_filter.py'
+      - '.github/workflows/garment-filter-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  CUDA_VISIBLE_DEVICES: ''
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download challenging jraffshoots source batch
+        run: |
+          mkdir -p source
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/9274341330/zip" > batch.zip
+          unzip -q batch.zip -d source
+          echo "jpg=$(find source -iname '*.jpg' | wc -l)"
+      - name: Install CPU vision stack
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install pillow==11.3.0 transformers huggingface_hub ultralytics
+      - name: Run FashionPedia plus CLIP probe
+        run: python probe_garment_filter.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: garment-filter-probe
+          path: garment_probe/
+          if-no-files-found: warn
+          retention-days: 7
