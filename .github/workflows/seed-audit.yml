@@ -1,0 +1,31 @@
+name: US street-style seed audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'audit_seeds.py'
+      - '.github/workflows/seed-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - name: Audit city seeds
+        run: python audit_seeds.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seed-audit
+          path: seed_audit.json
+          retention-days: 7
