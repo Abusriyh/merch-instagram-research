@@ -1,0 +1,38 @@
+name: Public Instagram API probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_public_api.py'
+      - '.github/workflows/api-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install curl_cffi
+        run: pip install curl_cffi==0.13.0
+      - name: Probe public endpoints and download samples
+        run: python probe_public_api.py
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-api-probe
+          path: |
+            api_probe_results.json
+            api_probe_images/
+          if-no-files-found: warn
+          retention-days: 7
