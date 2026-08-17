@@ -1,6 +1,10 @@
 name: Build US T-shirt 500
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/filter-tshirts-after-collect.yml'
   workflow_run:
     workflows: ["Collect US fashion 500"]
     types: [completed]
@@ -24,7 +28,7 @@ env:
 
 jobs:
   prepare:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       source_run_id: ${{ steps.source.outputs.run_id }}
@@ -39,7 +43,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             RUN_ID="${{ github.event.workflow_run.id }}"
-          elif [ -n "${{ inputs.source_run_id }}" ]; then
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.source_run_id }}" ]; then
             RUN_ID="${{ inputs.source_run_id }}"
           else
             RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/collect-500.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
@@ -77,7 +81,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -153,7 +156,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
