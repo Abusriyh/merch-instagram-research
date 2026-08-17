@@ -1,0 +1,81 @@
+name: Audit full T-shirt candidate pool
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vision_filter.py'
+      - '.github/workflows/garment-audit-full.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  CUDA_VISIBLE_DEVICES: ''
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve latest successful expanded collection
+        id: source
+        run: |
+          RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/collect-500.yml/runs?status=success&per_page=10" --jq '[.workflow_runs[] | select(.id == 31987863148 or (.created_at >= "2026-08-17T02:20:00Z"))][0].id')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            RUN_ID=31987863148
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using collection run $RUN_ID"
+
+      - name: Download every expanded account batch
+        run: |
+          mkdir -p collected zips
+          RUN_ID="${{ steps.source.outputs.run_id }}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("batch-")) | [.id,.name] | @tsv' > artifacts.tsv
+          while IFS=$'\t' read -r ID NAME; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > "zips/${ID}.zip"
+            unzip -q -o "zips/${ID}.zip" -d collected
+          done < artifacts.tsv
+          echo "jpg=$(find collected -iname '*.jpg' | wc -l)"
+          echo "meta=$(find collected -name 'batch_meta_*.json' | wc -l)"
+
+      - name: Merge full candidate pool before filtering
+        run: |
+          pip install pillow==11.3.0
+          python merge_candidates.py collected --out candidate_pool
+          cat candidate_pool/summary.json
+
+      - name: Install CPU garment vision stack
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers huggingface_hub
+
+      - name: Run garment-first T-shirt audit
+        run: |
+          python vision_filter.py candidate_pool --out garment_audit --review-limit 1200
+          cat garment_audit/summary.json
+
+      - name: Attach candidate summary
+        run: cp candidate_pool/summary.json garment_audit/candidate_pool_summary.json
+
+      - name: Upload audit and visual review sheets
+        uses: actions/upload-artifact@v4
+        with:
+          name: garment-audit-full
+          path: garment_audit/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 4
