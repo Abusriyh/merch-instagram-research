@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "Collect US fashion 500 run ID (optional for manual runs)"
+        description: "Collect US fashion 500 run ID (optional)"
         required: false
         type: string
 
@@ -23,17 +23,15 @@ env:
   PYTHONUNBUFFERED: '1'
 
 jobs:
-  build:
+  prepare:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      source_run_id: ${{ steps.source.outputs.run_id }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      batch_count: ${{ steps.matrix.outputs.batch_count }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
 
       - name: Resolve source collection run
         id: source
@@ -47,70 +45,159 @@ jobs:
             RUN_ID=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/collect-500.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
           fi
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-            echo "No successful collection run found" >&2
+            echo "No collection run found" >&2
             exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
           echo "Using collection run $RUN_ID"
 
-      - name: Download every account batch from collection run
+      - name: Build dynamic matrix from batch artifacts
+        id: matrix
         shell: bash
         run: |
-          mkdir -p collected artifact_zips
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${{ steps.source.outputs.run_id }}/artifacts?per_page=100" --paginate \
-            --jq '.artifacts[] | select(.name | startswith("batch-")) | [.id,.name] | @tsv' > artifacts.tsv
-          COUNT=$(wc -l < artifacts.tsv | tr -d ' ')
-          echo "batch artifacts: $COUNT"
+          RUN_ID="${{ steps.source.outputs.run_id }}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" > artifacts.json
+          MATRIX=$(jq -c '{include: [.artifacts[] | select(.name | startswith("batch-")) | (.name | capture("^batch-(?<city>[^-]+)-(?<handle>.+)$")) as $p | {artifact_id: .id, artifact_name: .name, city: $p.city, handle: $p.handle}]}' artifacts.json)
+          COUNT=$(echo "$MATRIX" | jq '.include | length')
+          echo "batch_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Found $COUNT account batches"
           if [ "$COUNT" -lt 1 ]; then
-            echo "No batch artifacts found" >&2
             exit 1
           fi
-          while IFS=$'\t' read -r ID NAME; do
-            echo "Downloading $NAME ($ID)"
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > "artifact_zips/${ID}.zip"
-            unzip -q -o "artifact_zips/${ID}.zip" -d collected
-          done < artifacts.tsv
-          echo "meta files: $(find collected -name 'batch_meta_*.json' | wc -l)"
-          echo "jpg files: $(find collected -iname '*.jpg' | wc -l)"
 
-      - name: Merge and dedupe full candidate pool
+  filter_account:
+    name: T-shirt gate ${{ matrix.city }} @${{ matrix.handle }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Download this account batch only
+        shell: bash
+        run: |
+          mkdir -p collected
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ matrix.artifact_id }}/zip" > account.zip
+          unzip -q account.zip -d collected
+          echo "jpg=$(find collected -iname '*.jpg' | wc -l)"
+
+      - name: Build account candidate pool
+        id: candidates
+        shell: bash
         run: |
           pip install pillow==11.3.0
           python merge_candidates.py collected --out candidate_pool
+          COUNT=$(python - <<'PY'
+          import json
+          print(json.load(open('candidate_pool/summary.json'))['unique_candidate_photos'])
+          PY
+          )
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           cat candidate_pool/summary.json
 
-      - name: Install CPU-only T-shirt vision stack
+      - name: Install CPU-only vision stack
+        if: ${{ steps.candidates.outputs.count != '0' }}
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install huggingface_hub transformers ultralytics
-          python - <<'PY'
-          import torch
-          print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())
-          PY
 
-      - name: Gate candidates by visibly worn T-shirt
+      - name: Run worn-T-shirt gate
+        if: ${{ steps.candidates.outputs.count != '0' }}
         run: |
-          python vision_filter.py candidate_pool --out vision_audit
+          python vision_filter.py candidate_pool --out vision_audit --lightweight
           cat vision_audit/summary.json
 
-      - name: Select newest 500 only after T-shirt gate
+      - name: Create empty result for empty account
+        if: ${{ steps.candidates.outputs.count == '0' }}
+        shell: bash
         run: |
-          python finalize_tshirts.py candidate_pool vision_audit --out final_tshirts --limit 500
+          mkdir -p vision_audit
+          echo '[]' > vision_audit/vision_results.json
+          echo '[]' > vision_audit/preliminary_rejections.json
+          printf '{"input_images":0,"accepted_tshirts":0,"handle":"%s","city":"%s"}\n' "${{ matrix.handle }}" "${{ matrix.city }}" > vision_audit/summary.json
+
+      - name: Namespace account result
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p vision_part/${{ matrix.city }}/${{ matrix.handle }}
+          cp -f vision_audit/vision_results.json vision_part/${{ matrix.city }}/${{ matrix.handle }}/vision_results.json 2>/dev/null || echo '[]' > vision_part/${{ matrix.city }}/${{ matrix.handle }}/vision_results.json
+          cp -f vision_audit/preliminary_rejections.json vision_part/${{ matrix.city }}/${{ matrix.handle }}/preliminary_rejections.json 2>/dev/null || echo '[]' > vision_part/${{ matrix.city }}/${{ matrix.handle }}/preliminary_rejections.json
+          cp -f vision_audit/summary.json vision_part/${{ matrix.city }}/${{ matrix.handle }}/summary.json 2>/dev/null || printf '{"error":"missing summary"}\n' > vision_part/${{ matrix.city }}/${{ matrix.handle }}/summary.json
+
+      - name: Upload account vision result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vision-${{ matrix.city }}-${{ matrix.handle }}
+          path: vision_part/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  finalize:
+    name: Assemble verified T-shirt sample
+    needs: [prepare, filter_account]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download all account vision results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vision-*
+          path: vision_parts
+          merge-multiple: true
+
+      - name: Combine T-shirt decisions
+        run: |
+          python combine_vision_results.py vision_parts --out combined_vision
+          cat combined_vision/summary.json
+
+      - name: Rebuild deduped candidate pool from source batches
+        shell: bash
+        run: |
+          pip install pillow==11.3.0
+          mkdir -p collected artifact_zips
+          RUN_ID="${{ needs.prepare.outputs.source_run_id }}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("batch-")) | [.id,.name] | @tsv' > artifacts.tsv
+          while IFS=$'\t' read -r ID NAME; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ID}/zip" > "artifact_zips/${ID}.zip"
+            unzip -q -o "artifact_zips/${ID}.zip" -d collected
+          done < artifacts.tsv
+          python merge_candidates.py collected --out candidate_pool
+          cat candidate_pool/summary.json
+
+      - name: Select newest 500 only from vision-accepted T-shirts
+        run: |
+          python finalize_tshirts.py candidate_pool combined_vision --out final_tshirts --limit 500
           cat final_tshirts/summary.json
 
-      - name: Attach QA diagnostics
+      - name: Attach diagnostics
         if: always()
         shell: bash
         run: |
           mkdir -p final_tshirts/qa
           cp -f candidate_pool/summary.json final_tshirts/qa/candidate_pool_summary.json 2>/dev/null || true
-          cp -f vision_audit/summary.json final_tshirts/qa/vision_summary.json 2>/dev/null || true
-          cp -f vision_audit/vision_results.csv final_tshirts/qa/vision_results.csv 2>/dev/null || true
-          cp -f vision_audit/preliminary_rejections.json final_tshirts/qa/preliminary_rejections.json 2>/dev/null || true
-          if [ -d vision_audit/contact_sheets ]; then
-            mkdir -p final_tshirts/qa/vision_contact_sheets
-            cp -f vision_audit/contact_sheets/*.jpg final_tshirts/qa/vision_contact_sheets/ 2>/dev/null || true
-          fi
+          cp -f combined_vision/summary.json final_tshirts/qa/vision_summary.json 2>/dev/null || true
+          cp -f combined_vision/vision_results.json final_tshirts/qa/vision_results.json 2>/dev/null || true
 
       - name: Upload T-shirt-only research sample
         if: always()
