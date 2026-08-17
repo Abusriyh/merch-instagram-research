@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,7 +63,6 @@ def load_items(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             rel = raw.get("file")
             if not rel:
                 continue
-            # Artifact download may flatten the original batch/ prefix depending on merge mode.
             candidates = [
                 root / rel,
                 root / str(rel).removeprefix("batch/"),
@@ -76,16 +74,49 @@ def load_items(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             row = dict(raw)
             row["_src_file"] = str(src)
             row["_timestamp"] = parse_timestamp(row.get("timestamp"))
+            try:
+                row["_profile_rank"] = int(row.get("profile_rank") or 999)
+            except Exception:
+                row["_profile_rank"] = 999
             items.append(row)
     return items, profiles
 
 
-def dedupe_and_sort(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Prefer content hash; shortcode is a secondary guard.
+def ordered_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str, float]:
+    if not items:
+        return [], "none", 0.0
+    valid_ts = [x for x in items if x.get("_timestamp", 0.0) >= 1_500_000_000]
+    timestamp_coverage = len(valid_ts) / len(items)
+    if timestamp_coverage >= 0.70:
+        return (
+            sorted(items, key=lambda x: x.get("_timestamp", 0.0), reverse=True),
+            "global_timestamp_desc",
+            timestamp_coverage,
+        )
+
+    # The mirror sometimes returns timestamp=0 while preserving each profile's newest-first order.
+    # Round-robin by profile rank keeps the panel recent and geography/account balanced.
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in items:
+        grouped[(str(row.get("city") or ""), str(row.get("handle") or ""))].append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda x: x.get("_profile_rank", 999))
+    keys = sorted(grouped)
+    max_rank = max((len(v) for v in grouped.values()), default=0)
+    out: list[dict[str, Any]] = []
+    for rank_idx in range(max_rank):
+        for key in keys:
+            rows = grouped[key]
+            if rank_idx < len(rows):
+                out.append(rows[rank_idx])
+    return out, "profile_recency_round_robin", timestamp_coverage
+
+
+def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen_hash: set[str] = set()
     seen_shortcode: set[str] = set()
     out: list[dict[str, Any]] = []
-    for row in sorted(items, key=lambda x: x.get("_timestamp", 0.0), reverse=True):
+    for row in items:
         sha = str(row.get("sha256") or "")
         shortcode = str(row.get("shortcode") or "")
         if sha and sha in seen_hash:
@@ -116,7 +147,6 @@ def copy_selected(selected: list[dict[str, Any]], final_dir: Path) -> list[dict[
 
 
 def text_font(size: int = 24):
-    # DejaVu is normally available on Ubuntu; Pillow default is a safe fallback.
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
@@ -151,7 +181,6 @@ def make_contact_sheets(metadata: list[dict[str, Any]], final_dir: Path) -> int:
             img_path = final_dir / row["selected_file"]
             try:
                 im = Image.open(img_path).convert("RGB")
-                # Leave label strip at top of each cell.
                 fitted = ImageOps.contain(im, (cell_w - 10, cell_h - label_h - 10), Image.Resampling.LANCZOS)
                 ix = x0 + (cell_w - fitted.width) // 2
                 iy = y0 + label_h + (cell_h - label_h - fitted.height) // 2
@@ -163,8 +192,7 @@ def make_contact_sheets(metadata: list[dict[str, Any]], final_dir: Path) -> int:
             city = str(row.get("city") or "")
             handle = str(row.get("handle") or "")
             draw.text((x0 + 8, y0 + 4), f"#{idx:04d}", fill="black", font=font_big)
-            label = f"{city} · @{handle}"
-            draw.text((x0 + 112, y0 + 12), label[:38], fill="black", font=font_small)
+            draw.text((x0 + 112, y0 + 12), f"{city} · @{handle}"[:38], fill="black", font=font_small)
         count += 1
         canvas.save(sheet_dir / f"sheet_{count:03d}.jpg", "JPEG", quality=88, optimize=True)
     return count
@@ -172,8 +200,8 @@ def make_contact_sheets(metadata: list[dict[str, Any]], final_dir: Path) -> int:
 
 def write_csv(metadata: list[dict[str, Any]], path: Path) -> None:
     fields = [
-        "index", "city", "handle", "kind", "shortcode", "source_url", "timestamp",
-        "sort_timestamp", "post_type", "is_video", "like_count", "comment_count",
+        "index", "city", "handle", "kind", "profile_rank", "shortcode", "source_url",
+        "timestamp", "sort_timestamp", "post_type", "is_video", "like_count", "comment_count",
         "caption", "selected_file", "width", "height", "sha256", "media_source_kind",
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -195,22 +223,20 @@ def main() -> None:
     final_dir.mkdir(parents=True, exist_ok=True)
 
     items, profiles = load_items(root)
-    unique = dedupe_and_sort(items)
+    ordered, selection_method, ts_coverage = ordered_items(items)
+    unique = dedupe(ordered)
     selected = unique[: args.limit]
     metadata = copy_selected(selected, final_dir)
     sheets = make_contact_sheets(metadata, final_dir)
 
-    (final_dir / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    (final_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     write_csv(metadata, final_dir / "metadata.csv")
 
     city_counts = Counter(str(x.get("city") or "unknown") for x in metadata)
     handle_counts = Counter(str(x.get("handle") or "unknown") for x in metadata)
     type_counts = Counter(str(x.get("post_type") or "unknown") for x in metadata)
-    profile_status = Counter(
-        "usable" if p.get("ok") and p.get("downloaded", 0) else "unusable" for p in profiles
-    )
+    rank_counts = Counter(str(x.get("profile_rank") or "unknown") for x in metadata)
+    profile_status = Counter("usable" if p.get("ok") and p.get("downloaded", 0) else "unusable" for p in profiles)
     summary = {
         "meta_files_found": len(profiles),
         "profile_status": dict(profile_status),
@@ -218,20 +244,23 @@ def main() -> None:
         "unique_items": len(unique),
         "selected_items": len(metadata),
         "requested_limit": args.limit,
+        "selection_method": selection_method,
+        "valid_timestamp_coverage": round(ts_coverage, 4),
         "contact_sheets": sheets,
         "city_counts": dict(city_counts),
         "handle_counts": dict(handle_counts.most_common()),
+        "profile_rank_counts": dict(rank_counts),
         "post_type_counts": dict(type_counts),
         "profiles": profiles,
         "note": "Geography-balanced, fashion/street-style-enriched public Instagram panel; not a random sample of all US Instagram uploads.",
     }
-    (final_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    (final_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({
         "raw": len(items),
         "unique": len(unique),
         "selected": len(metadata),
+        "selection_method": selection_method,
+        "timestamp_coverage": round(ts_coverage, 4),
         "sheets": sheets,
         "cities": dict(city_counts),
         "profiles": dict(profile_status),
