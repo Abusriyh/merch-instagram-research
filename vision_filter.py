@@ -60,7 +60,6 @@ def clamp_box(box: tuple[float, float, float, float], w: int, h: int) -> tuple[i
 
 
 def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf: list[float] | None, w: int, h: int) -> tuple[tuple[int, int, int, int], str]:
-    """Return a torso/upper-garment crop. Prefer visible shoulders+hips; fall back to person geometry."""
     px1, py1, px2, py2 = person_box
     pw, ph = max(1.0, px2 - px1), max(1.0, py2 - py1)
 
@@ -71,7 +70,6 @@ def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf:
             return False
         return float(xy[i][0]) > 1 and float(xy[i][1]) > 1
 
-    # COCO pose: 5/6 shoulders, 11/12 hips.
     if all(kp_ok(i) for i in (5, 6, 11, 12)):
         pts = [xy[i] for i in (5, 6, 11, 12)]
         xs = [float(p[0]) for p in pts]
@@ -79,7 +77,6 @@ def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf:
         hip_y = max(float(xy[11][1]), float(xy[12][1]))
         torso_h = max(20.0, hip_y - shoulder_y)
         torso_w = max(20.0, max(xs) - min(xs))
-        # Include sleeves while avoiding most trousers/skirts.
         box = (
             min(xs) - torso_w * 0.38,
             shoulder_y - torso_h * 0.16,
@@ -95,7 +92,6 @@ def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf:
         box = (sx1 - sw * 0.48, sy - ph * 0.04, sx2 + sw * 0.48, sy + ph * 0.43)
         return clamp_box(box, w, h), "pose_shoulders"
 
-    # Conservative fallback: upper 55% of the detected person, with slight side trimming.
     box = (px1 + pw * 0.08, py1 + ph * 0.10, px2 - pw * 0.08, py1 + ph * 0.60)
     return clamp_box(box, w, h), "person_geometry"
 
@@ -107,8 +103,7 @@ def classify_crops(crops: list[Image.Image], processor, model, batch_size: int =
         batch = crops[start : start + batch_size]
         inputs = processor(images=batch, return_tensors="pt")
         with torch.inference_mode():
-            logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1).cpu()
+            probs = torch.softmax(model(**inputs).logits, dim=-1).cpu()
         for row in probs:
             outputs.append({str(labels[i]): float(row[i]) for i in range(len(row))})
     return outputs
@@ -116,12 +111,10 @@ def classify_crops(crops: list[Image.Image], processor, model, batch_size: int =
 
 def make_sheet(rows: list[dict[str, Any]], image_root: Path, out_path: Path, accepted: bool) -> None:
     cols, rcount = 4, 4
-    cell_w, cell_h = 500, 500
-    label_h = 92
+    cell_w, cell_h, label_h = 500, 500, 92
     canvas = Image.new("RGB", (cols * cell_w, rcount * cell_h), "white")
     draw = ImageDraw.Draw(canvas)
-    f1 = font(21, True)
-    f2 = font(15, False)
+    f1, f2 = font(21, True), font(15, False)
     for pos, row in enumerate(rows[: cols * rcount]):
         rr, cc = divmod(pos, cols)
         x0, y0 = cc * cell_w, rr * cell_h
@@ -155,6 +148,7 @@ def main() -> None:
     ap.add_argument("--margin-threshold", type=float, default=0.10)
     ap.add_argument("--person-conf", type=float, default=0.35)
     ap.add_argument("--min-person-area", type=float, default=0.07)
+    ap.add_argument("--lightweight", action="store_true", help="Write only result metadata; skip image copies/contact sheets")
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -162,13 +156,19 @@ def main() -> None:
     out = Path(args.out)
     if out.exists():
         shutil.rmtree(out)
-    for d in ("accepted", "rejected_top", "contact_sheets", "crops"):
-        (out / d).mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    if not args.lightweight:
+        for d in ("accepted", "rejected_top", "contact_sheets", "crops"):
+            (out / d).mkdir(parents=True, exist_ok=True)
 
     metadata = load_metadata(root)
     paths = sorted([p for p in image_root.glob("*.jpg") if p.is_file()])
     if not paths:
-        raise SystemExit(f"No JPG images found in {image_root}")
+        (out / "vision_results.json").write_text("[]", encoding="utf-8")
+        (out / "preliminary_rejections.json").write_text("[]", encoding="utf-8")
+        (out / "summary.json").write_text(json.dumps({"input_images": 0, "accepted_tshirts": 0}), encoding="utf-8")
+        print("No JPG images found; wrote empty results", flush=True)
+        return
 
     print(f"images={len(paths)}", flush=True)
     pose = YOLO("yolo11n-pose.pt")
@@ -176,13 +176,14 @@ def main() -> None:
     classifier = AutoModelForImageClassification.from_pretrained(CLASSIFIER_REPO)
     classifier.eval()
 
-    pose_results = list(pose.predict([str(p) for p in paths], imgsz=640, conf=args.person_conf, verbose=False, stream=True))
-
     candidate_rows: list[dict[str, Any]] = []
     candidate_crops: list[Image.Image] = []
     prelim_rejected: list[dict[str, Any]] = []
 
-    for seq, (path, res) in enumerate(zip(paths, pose_results), start=1):
+    # Stream pose results instead of materializing all result tensors at once. This keeps memory bounded
+    # and prevents the hosted runner shutdown seen when processing hundreds of photos in one list().
+    result_stream = pose.predict([str(p) for p in paths], imgsz=512, conf=args.person_conf, verbose=False, stream=True, device="cpu")
+    for seq, (path, res) in enumerate(zip(paths, result_stream), start=1):
         try:
             im = Image.open(path).convert("RGB")
         except Exception as exc:
@@ -206,7 +207,6 @@ def main() -> None:
             area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
             ratio = area / image_area if image_area else 0.0
             if ratio >= args.min_person_area:
-                # Favor large, clear people; this avoids tiny background pedestrians.
                 people.append((float(bconfs[i]) * math.sqrt(ratio), i))
         people.sort(reverse=True)
         if not people:
@@ -219,9 +219,8 @@ def main() -> None:
             cf = kconf[i] if i < len(kconf) else None
             torso_box, method = torso_from_pose(xyxys[i], xy, cf, w, h)
             x1, y1, x2, y2 = torso_box
-            if x2 - x1 < 80 or y2 - y1 < 80:
+            if x2 - x1 < 70 or y2 - y1 < 70:
                 continue
-            crop = im.crop(torso_box)
             candidate_rows.append({
                 "index": int(meta.get("index") or seq),
                 "source_name": path.name,
@@ -229,15 +228,20 @@ def main() -> None:
                 "handle": meta.get("handle"),
                 "source_url": meta.get("source_url"),
                 "timestamp": meta.get("timestamp"),
+                "parent_shortcode": meta.get("parent_shortcode"),
+                "shortcode": meta.get("shortcode"),
+                "child_index": meta.get("child_index"),
+                "is_carousel_child": meta.get("is_carousel_child"),
                 "person_conf": float(bconfs[i]),
                 "person_box": [float(v) for v in xyxys[i]],
                 "torso_box": list(torso_box),
                 "crop_method": method,
             })
-            candidate_crops.append(crop)
+            candidate_crops.append(im.crop(torso_box))
 
     print(f"candidate_torsos={len(candidate_crops)} prelim_rejected={len(prelim_rejected)}", flush=True)
     probs = classify_crops(candidate_crops, processor, classifier)
+    candidate_crops.clear()
 
     best_by_image: dict[str, dict[str, Any]] = {}
     for row, prob in zip(candidate_rows, probs):
@@ -246,7 +250,6 @@ def main() -> None:
         best_neg_name, best_neg_prob = negatives[0] if negatives else ("", 0.0)
         margin = tshirt - best_neg_prob
         top_label, top_prob = max(prob.items(), key=lambda kv: kv[1])
-        # Pose confidence is not used as a substitute for garment classification; it only breaks ties.
         combined = tshirt * (0.7 + 0.3 * float(row["person_conf"]))
         row.update({
             "classifier_top": top_label,
@@ -265,38 +268,33 @@ def main() -> None:
     accepted: list[dict[str, Any]] = []
     rejected_scored: list[dict[str, Any]] = []
     for row in best_by_image.values():
-        ok = (
-            row["classifier_top"] == "T-shirt"
-            and row["tshirt_prob"] >= args.tshirt_threshold
-            and row["margin"] >= args.margin_threshold
-        )
+        ok = row["classifier_top"] == "T-shirt" and row["tshirt_prob"] >= args.tshirt_threshold and row["margin"] >= args.margin_threshold
         row["decision"] = "accepted_tshirt" if ok else "classifier_reject"
         (accepted if ok else rejected_scored).append(row)
 
     accepted.sort(key=lambda r: ((r.get("timestamp") or 0), r["combined_score"]), reverse=True)
     rejected_scored.sort(key=lambda r: r["tshirt_prob"], reverse=True)
 
-    for n, row in enumerate(accepted, start=1):
-        src = image_root / row["source_name"]
-        shutil.copy2(src, out / "accepted" / f"{n:04d}_{row['source_name']}")
-        try:
-            im = Image.open(src).convert("RGB")
-            crop = im.crop(tuple(int(v) for v in row["torso_box"]))
-            crop.save(out / "crops" / f"{n:04d}_{row['source_name']}", "JPEG", quality=90)
-        except Exception:
-            pass
-    for n, row in enumerate(rejected_scored[:96], start=1):
-        shutil.copy2(image_root / row["source_name"], out / "rejected_top" / f"{n:04d}_{row['source_name']}")
-
-    for start in range(0, len(accepted), 16):
-        make_sheet(accepted[start:start+16], image_root, out / "contact_sheets" / f"accepted_{start//16+1:03d}.jpg", True)
-    for start in range(0, min(len(rejected_scored), 96), 16):
-        make_sheet(rejected_scored[start:start+16], image_root, out / "contact_sheets" / f"borderline_rejected_{start//16+1:03d}.jpg", False)
+    if not args.lightweight:
+        for n, row in enumerate(accepted, start=1):
+            src = image_root / row["source_name"]
+            shutil.copy2(src, out / "accepted" / f"{n:04d}_{row['source_name']}")
+            try:
+                im = Image.open(src).convert("RGB")
+                crop = im.crop(tuple(int(v) for v in row["torso_box"]))
+                crop.save(out / "crops" / f"{n:04d}_{row['source_name']}", "JPEG", quality=90)
+            except Exception:
+                pass
+        for n, row in enumerate(rejected_scored[:96], start=1):
+            shutil.copy2(image_root / row["source_name"], out / "rejected_top" / f"{n:04d}_{row['source_name']}")
+        for start in range(0, len(accepted), 16):
+            make_sheet(accepted[start:start+16], image_root, out / "contact_sheets" / f"accepted_{start//16+1:03d}.jpg", True)
+        for start in range(0, min(len(rejected_scored), 96), 16):
+            make_sheet(rejected_scored[start:start+16], image_root, out / "contact_sheets" / f"borderline_rejected_{start//16+1:03d}.jpg", False)
 
     fields = [
-        "index", "source_name", "decision", "city", "handle", "source_url", "timestamp",
-        "person_conf", "crop_method", "classifier_top", "classifier_top_prob", "tshirt_prob",
-        "best_negative", "best_negative_prob", "margin", "combined_score", "person_box", "torso_box",
+        "index", "source_name", "decision", "city", "handle", "source_url", "timestamp", "parent_shortcode", "shortcode", "child_index", "is_carousel_child",
+        "person_conf", "crop_method", "classifier_top", "classifier_top_prob", "tshirt_prob", "best_negative", "best_negative_prob", "margin", "combined_score", "person_box", "torso_box",
     ]
     all_rows = accepted + rejected_scored
     with (out / "vision_results.csv").open("w", newline="", encoding="utf-8-sig") as f:
@@ -308,7 +306,7 @@ def main() -> None:
 
     summary = {
         "input_images": len(paths),
-        "candidate_torsos": len(candidate_crops),
+        "candidate_torsos": len(candidate_rows),
         "images_with_scored_torso": len(best_by_image),
         "accepted_tshirts": len(accepted),
         "classifier_rejected": len(rejected_scored),
@@ -319,7 +317,8 @@ def main() -> None:
             "person_conf": args.person_conf,
             "min_person_area_ratio": args.min_person_area,
         },
-        "method": "YOLO11 pose person localization -> pose-derived torso crop -> independent ViT clothing classifier. Conservative acceptance requires T-shirt as top class plus absolute probability and margin thresholds. Contact sheets are generated for human QA before any research conclusion.",
+        "method": "Streaming YOLO11 pose person localization -> pose-derived torso crop -> independent ViT clothing classifier. Acceptance requires T-shirt as top class plus probability and margin thresholds.",
+        "lightweight": args.lightweight,
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
