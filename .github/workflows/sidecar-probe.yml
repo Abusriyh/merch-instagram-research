@@ -1,0 +1,39 @@
+name: Instagram carousel yield probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_sidecars.py'
+      - '.github/workflows/sidecar-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.handle }}
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        handle: [watchingnewyork, inthestreetsla, cpplunkett, aimeesong, imjennim, sincerelyjules, atxstreetstyle, ballardstreetstyle, genstreetstyle, jraffshoots, melwearswhat, stylebywale]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - name: Probe carousel yield
+        env:
+          HANDLE: ${{ matrix.handle }}
+        run: python probe_sidecars.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sidecar-${{ matrix.handle }}
+          path: sidecar_result.json
+          retention-days: 7
