@@ -5,70 +5,16 @@ import csv
 import json
 import math
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-from huggingface_hub import hf_hub_download
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 from ultralytics import YOLO
 
-
-FASHION_REPO = "AltaDaily/yolo11n-fashionpedia"
-FASHION_FILE = "best.pt"
 CLASSIFIER_REPO = "dima806/clothes_image_detection"
-
-# FashionPedia upper-body categories that can plausibly contain/mask a T-shirt.
-UPPER_LABELS = {
-    "shirt/blouse",
-    "shirt, blouse",
-    "top/t-shirt/sweatshirt",
-    "top, t-shirt, sweatshirt",
-    "sweater",
-    "cardigan",
-    "jacket",
-    "vest",
-    "coat",
-    "dress",
-    "jumpsuit",
-}
-
-NEGATIVE_UPPER = {"Polo", "Shirt", "Hoodie", "Sweater", "Jacket", "Blazer", "Coat", "Sports Jacket"}
-
-
-@dataclass
-class Box:
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    conf: float
-    label: str
-
-    @property
-    def area(self) -> float:
-        return max(0.0, self.x2 - self.x1) * max(0.0, self.y2 - self.y1)
-
-
-def intersection_over_garment(garment: Box, person: Box) -> float:
-    ix1 = max(garment.x1, person.x1)
-    iy1 = max(garment.y1, person.y1)
-    ix2 = min(garment.x2, person.x2)
-    iy2 = min(garment.y2, person.y2)
-    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-    return inter / garment.area if garment.area > 0 else 0.0
-
-
-def expand_box(box: Box, w: int, h: int, frac: float = 0.12) -> tuple[int, int, int, int]:
-    bw = box.x2 - box.x1
-    bh = box.y2 - box.y1
-    x1 = max(0, int(box.x1 - bw * frac))
-    y1 = max(0, int(box.y1 - bh * frac))
-    x2 = min(w, int(box.x2 + bw * frac))
-    y2 = min(h, int(box.y2 + bh * frac))
-    return x1, y1, x2, y2
+NEGATIVE_UPPER = {"Polo", "Shirt", "Hoodie", "Sweater", "Jacket", "Blazer", "Coat", "Sports Jacket", "Dresses"}
 
 
 def load_metadata(root: Path) -> dict[str, dict[str, Any]]:
@@ -103,20 +49,58 @@ def font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def to_boxes(result, names: dict[int, str], label_filter: set[str] | None = None) -> list[Box]:
-    out: list[Box] = []
-    boxes = getattr(result, "boxes", None)
-    if boxes is None:
-        return out
-    for xyxy, conf, cls in zip(boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist(), boxes.cls.cpu().tolist()):
-        label = str(names.get(int(cls), int(cls)))
-        if label_filter is not None and label not in label_filter:
-            continue
-        out.append(Box(float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]), float(conf), label))
-    return out
+def clamp_box(box: tuple[float, float, float, float], w: int, h: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    return (
+        max(0, min(w - 1, int(x1))),
+        max(0, min(h - 1, int(y1))),
+        max(1, min(w, int(x2))),
+        max(1, min(h, int(y2))),
+    )
 
 
-def classify_crops(crops: list[Image.Image], processor, model, batch_size: int = 16) -> list[dict[str, float]]:
+def torso_from_pose(person_box: list[float], xy: list[list[float]] | None, conf: list[float] | None, w: int, h: int) -> tuple[tuple[int, int, int, int], str]:
+    """Return a torso/upper-garment crop. Prefer visible shoulders+hips; fall back to person geometry."""
+    px1, py1, px2, py2 = person_box
+    pw, ph = max(1.0, px2 - px1), max(1.0, py2 - py1)
+
+    def kp_ok(i: int) -> bool:
+        if xy is None or i >= len(xy):
+            return False
+        if conf is not None and i < len(conf) and float(conf[i]) < 0.25:
+            return False
+        return float(xy[i][0]) > 1 and float(xy[i][1]) > 1
+
+    # COCO pose: 5/6 shoulders, 11/12 hips.
+    if all(kp_ok(i) for i in (5, 6, 11, 12)):
+        pts = [xy[i] for i in (5, 6, 11, 12)]
+        xs = [float(p[0]) for p in pts]
+        shoulder_y = min(float(xy[5][1]), float(xy[6][1]))
+        hip_y = max(float(xy[11][1]), float(xy[12][1]))
+        torso_h = max(20.0, hip_y - shoulder_y)
+        torso_w = max(20.0, max(xs) - min(xs))
+        # Include sleeves while avoiding most trousers/skirts.
+        box = (
+            min(xs) - torso_w * 0.38,
+            shoulder_y - torso_h * 0.16,
+            max(xs) + torso_w * 0.38,
+            hip_y - torso_h * 0.03,
+        )
+        return clamp_box(box, w, h), "pose_shoulders_hips"
+
+    if kp_ok(5) and kp_ok(6):
+        sx1, sx2 = sorted([float(xy[5][0]), float(xy[6][0])])
+        sy = min(float(xy[5][1]), float(xy[6][1]))
+        sw = max(20.0, sx2 - sx1)
+        box = (sx1 - sw * 0.48, sy - ph * 0.04, sx2 + sw * 0.48, sy + ph * 0.43)
+        return clamp_box(box, w, h), "pose_shoulders"
+
+    # Conservative fallback: upper 55% of the detected person, with slight side trimming.
+    box = (px1 + pw * 0.08, py1 + ph * 0.10, px2 - pw * 0.08, py1 + ph * 0.60)
+    return clamp_box(box, w, h), "person_geometry"
+
+
+def classify_crops(crops: list[Image.Image], processor, model, batch_size: int = 12) -> list[dict[str, float]]:
     outputs: list[dict[str, float]] = []
     labels = {int(k): v for k, v in model.config.id2label.items()} if isinstance(model.config.id2label, dict) else model.config.id2label
     for start in range(0, len(crops), batch_size):
@@ -136,15 +120,15 @@ def make_sheet(rows: list[dict[str, Any]], image_root: Path, out_path: Path, acc
     label_h = 92
     canvas = Image.new("RGB", (cols * cell_w, rcount * cell_h), "white")
     draw = ImageDraw.Draw(canvas)
-    f1 = font(22, True)
-    f2 = font(16, False)
+    f1 = font(21, True)
+    f2 = font(15, False)
     for pos, row in enumerate(rows[: cols * rcount]):
         rr, cc = divmod(pos, cols)
         x0, y0 = cc * cell_w, rr * cell_h
         path = image_root / row["source_name"]
         try:
             im = Image.open(path).convert("RGB")
-            ann = row.get("garment_box")
+            ann = row.get("torso_box")
             if ann:
                 d = ImageDraw.Draw(im)
                 x1, y1, x2, y2 = [int(v) for v in ann]
@@ -157,10 +141,8 @@ def make_sheet(rows: list[dict[str, Any]], image_root: Path, out_path: Path, acc
             pass
         draw.rectangle((x0, y0, x0 + cell_w - 1, y0 + cell_h - 1), outline="black", width=2)
         draw.text((x0 + 8, y0 + 5), f"#{row.get('index','?')} {row.get('decision','')}", fill="black", font=f1)
-        score = row.get("tshirt_prob", 0.0)
-        margin = row.get("margin", 0.0)
-        draw.text((x0 + 8, y0 + 36), f"T={score:.2f} margin={margin:.2f} det={row.get('fashion_conf',0):.2f}", fill="black", font=f2)
-        draw.text((x0 + 8, y0 + 60), f"@{row.get('handle','')} · {row.get('city','')}"[:55], fill="black", font=f2)
+        draw.text((x0 + 8, y0 + 35), f"T={row.get('tshirt_prob',0):.2f} margin={row.get('margin',0):.2f} person={row.get('person_conf',0):.2f}", fill="black", font=f2)
+        draw.text((x0 + 8, y0 + 60), f"{row.get('crop_method','')} · @{row.get('handle','')}"[:57], fill="black", font=f2)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path, "JPEG", quality=88, optimize=True)
 
@@ -169,12 +151,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("root", nargs="?", default="source")
     ap.add_argument("--out", default="vision_audit")
-    ap.add_argument("--tshirt-threshold", type=float, default=0.48)
-    ap.add_argument("--margin-threshold", type=float, default=0.08)
-    ap.add_argument("--person-conf", type=float, default=0.25)
-    ap.add_argument("--fashion-conf", type=float, default=0.20)
-    ap.add_argument("--garment-person-overlap", type=float, default=0.72)
-    ap.add_argument("--min-garment-area", type=float, default=0.018)
+    ap.add_argument("--tshirt-threshold", type=float, default=0.50)
+    ap.add_argument("--margin-threshold", type=float, default=0.10)
+    ap.add_argument("--person-conf", type=float, default=0.35)
+    ap.add_argument("--min-person-area", type=float, default=0.07)
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -182,9 +162,8 @@ def main() -> None:
     out = Path(args.out)
     if out.exists():
         shutil.rmtree(out)
-    (out / "accepted").mkdir(parents=True, exist_ok=True)
-    (out / "rejected_top").mkdir(parents=True, exist_ok=True)
-    (out / "contact_sheets").mkdir(parents=True, exist_ok=True)
+    for d in ("accepted", "rejected_top", "contact_sheets", "crops"):
+        (out / d).mkdir(parents=True, exist_ok=True)
 
     metadata = load_metadata(root)
     paths = sorted([p for p in image_root.glob("*.jpg") if p.is_file()])
@@ -192,82 +171,74 @@ def main() -> None:
         raise SystemExit(f"No JPG images found in {image_root}")
 
     print(f"images={len(paths)}", flush=True)
-    fashion_weights = hf_hub_download(repo_id=FASHION_REPO, filename=FASHION_FILE)
-    fashion = YOLO(fashion_weights)
-    people = YOLO("yolo11n.pt")
+    pose = YOLO("yolo11n-pose.pt")
     processor = AutoImageProcessor.from_pretrained(CLASSIFIER_REPO)
     classifier = AutoModelForImageClassification.from_pretrained(CLASSIFIER_REPO)
     classifier.eval()
 
-    # Run both detectors over all files. Ultralytics streams results in source order.
-    person_results = list(people.predict([str(p) for p in paths], imgsz=640, conf=args.person_conf, classes=[0], verbose=False, stream=True))
-    fashion_results = list(fashion.predict([str(p) for p in paths], imgsz=640, conf=args.fashion_conf, verbose=False, stream=True))
+    pose_results = list(pose.predict([str(p) for p in paths], imgsz=640, conf=args.person_conf, verbose=False, stream=True))
 
     candidate_rows: list[dict[str, Any]] = []
     candidate_crops: list[Image.Image] = []
     prelim_rejected: list[dict[str, Any]] = []
 
-    for idx, (path, pres, fres) in enumerate(zip(paths, person_results, fashion_results), start=1):
+    for seq, (path, res) in enumerate(zip(paths, pose_results), start=1):
         try:
             im = Image.open(path).convert("RGB")
         except Exception as exc:
-            prelim_rejected.append({"index": idx, "source_name": path.name, "decision": "decode_error", "error": repr(exc)})
+            prelim_rejected.append({"source_name": path.name, "decision": "decode_error", "error": repr(exc)})
             continue
         w, h = im.size
         image_area = float(w * h)
-        person_boxes = to_boxes(pres, pres.names, {"person"})
-        if not person_boxes:
-            prelim_rejected.append({"index": idx, "source_name": path.name, "decision": "no_person"})
+        boxes = getattr(res, "boxes", None)
+        keypoints = getattr(res, "keypoints", None)
+        if boxes is None or len(boxes) == 0:
+            prelim_rejected.append({"source_name": path.name, "decision": "no_person"})
             continue
 
-        upper_boxes = [b for b in to_boxes(fres, fres.names) if b.label.lower() in {x.lower() for x in UPPER_LABELS}]
-        if not upper_boxes:
-            prelim_rejected.append({"index": idx, "source_name": path.name, "decision": "no_upper_garment"})
+        xyxys = boxes.xyxy.cpu().tolist()
+        bconfs = boxes.conf.cpu().tolist()
+        kxy = keypoints.xy.cpu().tolist() if keypoints is not None and keypoints.xy is not None else []
+        kconf = keypoints.conf.cpu().tolist() if keypoints is not None and keypoints.conf is not None else []
+
+        people: list[tuple[float, int]] = []
+        for i, b in enumerate(xyxys):
+            area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+            ratio = area / image_area if image_area else 0.0
+            if ratio >= args.min_person_area:
+                # Favor large, clear people; this avoids tiny background pedestrians.
+                people.append((float(bconfs[i]) * math.sqrt(ratio), i))
+        people.sort(reverse=True)
+        if not people:
+            prelim_rejected.append({"source_name": path.name, "decision": "person_too_small"})
             continue
 
-        plausible: list[tuple[float, Box, float]] = []
-        for g in upper_boxes:
-            area_ratio = g.area / image_area if image_area else 0.0
-            if area_ratio < args.min_garment_area:
+        meta = metadata.get(path.name, {})
+        for _, i in people[:2]:
+            xy = kxy[i] if i < len(kxy) else None
+            cf = kconf[i] if i < len(kconf) else None
+            torso_box, method = torso_from_pose(xyxys[i], xy, cf, w, h)
+            x1, y1, x2, y2 = torso_box
+            if x2 - x1 < 80 or y2 - y1 < 80:
                 continue
-            overlap = max((intersection_over_garment(g, p) for p in person_boxes), default=0.0)
-            if overlap < args.garment_person_overlap:
-                continue
-            # Ranking favors a confident, clearly visible garment that is actually on a person.
-            rank = g.conf * math.sqrt(max(area_ratio, 1e-9)) * overlap
-            plausible.append((rank, g, overlap))
-
-        if not plausible:
-            prelim_rejected.append({"index": idx, "source_name": path.name, "decision": "garment_not_clear_on_person"})
-            continue
-
-        plausible.sort(key=lambda x: x[0], reverse=True)
-        # Keep at most the two best upper garments in group shots.
-        for rank, g, overlap in plausible[:2]:
-            crop_box = expand_box(g, w, h, 0.12)
-            crop = im.crop(crop_box)
-            if crop.width < 80 or crop.height < 80:
-                continue
-            meta = metadata.get(path.name, {})
+            crop = im.crop(torso_box)
             candidate_rows.append({
-                "index": int(meta.get("index") or idx),
+                "index": int(meta.get("index") or seq),
                 "source_name": path.name,
                 "city": meta.get("city"),
                 "handle": meta.get("handle"),
                 "source_url": meta.get("source_url"),
                 "timestamp": meta.get("timestamp"),
-                "fashion_label": g.label,
-                "fashion_conf": g.conf,
-                "person_overlap": overlap,
-                "garment_box": [g.x1, g.y1, g.x2, g.y2],
-                "crop_box": list(crop_box),
+                "person_conf": float(bconfs[i]),
+                "person_box": [float(v) for v in xyxys[i]],
+                "torso_box": list(torso_box),
+                "crop_method": method,
             })
             candidate_crops.append(crop)
 
-    print(f"candidate_crops={len(candidate_crops)} prelim_rejected={len(prelim_rejected)}", flush=True)
-    probs = classify_crops(candidate_crops, processor, classifier, batch_size=16)
+    print(f"candidate_torsos={len(candidate_crops)} prelim_rejected={len(prelim_rejected)}", flush=True)
+    probs = classify_crops(candidate_crops, processor, classifier)
 
-    # Multiple candidate garments can come from one image. Keep the strongest T-shirt decision per image.
     best_by_image: dict[str, dict[str, Any]] = {}
     for row, prob in zip(candidate_rows, probs):
         tshirt = float(prob.get("T-shirt", 0.0))
@@ -275,10 +246,11 @@ def main() -> None:
         best_neg_name, best_neg_prob = negatives[0] if negatives else ("", 0.0)
         margin = tshirt - best_neg_prob
         top_label, top_prob = max(prob.items(), key=lambda kv: kv[1])
-        combined = tshirt * float(row["fashion_conf"]) * float(row["person_overlap"])
+        # Pose confidence is not used as a substitute for garment classification; it only breaks ties.
+        combined = tshirt * (0.7 + 0.3 * float(row["person_conf"]))
         row.update({
             "classifier_top": top_label,
-            "classifier_top_prob": top_prob,
+            "classifier_top_prob": float(top_prob),
             "tshirt_prob": tshirt,
             "best_negative": best_neg_name,
             "best_negative_prob": best_neg_prob,
@@ -293,8 +265,6 @@ def main() -> None:
     accepted: list[dict[str, Any]] = []
     rejected_scored: list[dict[str, Any]] = []
     for row in best_by_image.values():
-        # Conservative: T-shirt must be the classifier's top label, with an absolute probability
-        # and a meaningful margin over the most likely long-sleeve/formal alternative.
         ok = (
             row["classifier_top"] == "T-shirt"
             and row["tshirt_prob"] >= args.tshirt_threshold
@@ -303,41 +273,43 @@ def main() -> None:
         row["decision"] = "accepted_tshirt" if ok else "classifier_reject"
         (accepted if ok else rejected_scored).append(row)
 
-    accepted.sort(key=lambda r: (r.get("timestamp") or 0, r["combined_score"]), reverse=True)
+    accepted.sort(key=lambda r: ((r.get("timestamp") or 0), r["combined_score"]), reverse=True)
     rejected_scored.sort(key=lambda r: r["tshirt_prob"], reverse=True)
 
     for n, row in enumerate(accepted, start=1):
         src = image_root / row["source_name"]
         shutil.copy2(src, out / "accepted" / f"{n:04d}_{row['source_name']}")
+        try:
+            im = Image.open(src).convert("RGB")
+            crop = im.crop(tuple(int(v) for v in row["torso_box"]))
+            crop.save(out / "crops" / f"{n:04d}_{row['source_name']}", "JPEG", quality=90)
+        except Exception:
+            pass
     for n, row in enumerate(rejected_scored[:96], start=1):
-        src = image_root / row["source_name"]
-        shutil.copy2(src, out / "rejected_top" / f"{n:04d}_{row['source_name']}")
+        shutil.copy2(image_root / row["source_name"], out / "rejected_top" / f"{n:04d}_{row['source_name']}")
 
-    # Annotated contact sheets are the human QA layer.
     for start in range(0, len(accepted), 16):
-        make_sheet(accepted[start : start + 16], image_root, out / "contact_sheets" / f"accepted_{start//16+1:03d}.jpg", True)
+        make_sheet(accepted[start:start+16], image_root, out / "contact_sheets" / f"accepted_{start//16+1:03d}.jpg", True)
     for start in range(0, min(len(rejected_scored), 96), 16):
-        make_sheet(rejected_scored[start : start + 16], image_root, out / "contact_sheets" / f"borderline_rejected_{start//16+1:03d}.jpg", False)
+        make_sheet(rejected_scored[start:start+16], image_root, out / "contact_sheets" / f"borderline_rejected_{start//16+1:03d}.jpg", False)
 
-    all_rows = accepted + rejected_scored
     fields = [
         "index", "source_name", "decision", "city", "handle", "source_url", "timestamp",
-        "fashion_label", "fashion_conf", "person_overlap", "classifier_top", "classifier_top_prob",
-        "tshirt_prob", "best_negative", "best_negative_prob", "margin", "combined_score",
-        "garment_box", "crop_box",
+        "person_conf", "crop_method", "classifier_top", "classifier_top_prob", "tshirt_prob",
+        "best_negative", "best_negative_prob", "margin", "combined_score", "person_box", "torso_box",
     ]
+    all_rows = accepted + rejected_scored
     with (out / "vision_results.csv").open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(all_rows)
-
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_rows)
     (out / "vision_results.json").write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     (out / "preliminary_rejections.json").write_text(json.dumps(prelim_rejected, ensure_ascii=False, indent=2), encoding="utf-8")
 
     summary = {
         "input_images": len(paths),
-        "candidate_garment_crops": len(candidate_crops),
-        "images_with_scored_upper_garment": len(best_by_image),
+        "candidate_torsos": len(candidate_crops),
+        "images_with_scored_torso": len(best_by_image),
         "accepted_tshirts": len(accepted),
         "classifier_rejected": len(rejected_scored),
         "preliminary_rejected": len(prelim_rejected),
@@ -345,11 +317,9 @@ def main() -> None:
             "tshirt_probability": args.tshirt_threshold,
             "margin": args.margin_threshold,
             "person_conf": args.person_conf,
-            "fashion_conf": args.fashion_conf,
-            "garment_person_overlap": args.garment_person_overlap,
-            "min_garment_area_ratio": args.min_garment_area,
+            "min_person_area_ratio": args.min_person_area,
         },
-        "method": "COCO person detection + FashionPedia garment detection + independent ViT clothing classification. Conservative acceptance requires a visibly worn upper garment classified as T-shirt with probability and margin thresholds.",
+        "method": "YOLO11 pose person localization -> pose-derived torso crop -> independent ViT clothing classifier. Conservative acceptance requires T-shirt as top class plus absolute probability and margin thresholds. Contact sheets are generated for human QA before any research conclusion.",
     }
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
