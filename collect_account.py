@@ -144,6 +144,7 @@ def main() -> None:
                 "handle": HANDLE,
                 "city": CITY,
                 "kind": KIND,
+                "profile_rank": idx + 1,
                 "shortcode": shortcode,
                 "source_url": f"https://www.instagram.com/p/{shortcode}/",
                 "timestamp": post.get("timestamp"),
