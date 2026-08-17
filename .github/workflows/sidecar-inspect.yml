@@ -1,0 +1,31 @@
+name: Instagram sidecar inspection
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'inspect_sidecars.py'
+      - '.github/workflows/sidecar-inspect.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - name: Inspect sidecars
+        run: python inspect_sidecars.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sidecar-inspection
+          path: sidecar_inspection.json
+          retention-days: 7
