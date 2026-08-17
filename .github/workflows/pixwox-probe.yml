@@ -1,0 +1,31 @@
+name: Pixwox pagination probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'probe_pixwox_pagination.py'
+      - '.github/workflows/pixwox-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install curl_cffi==0.13.0
+      - run: python probe_pixwox_pagination.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pixwox-pagination-probe
+          path: pixwox_pagination_probe.json
+          if-no-files-found: warn
+          retention-days: 7
